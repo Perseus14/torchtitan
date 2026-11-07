@@ -124,6 +124,77 @@ optimizations:
   `[B, S, H*D] <-> [B, H, S, D]` attention prologue/epilogue in forward and
   backward (+13% on GraphTrainer).
 
+`--config=hf_esmc600m_mlm_uniref50_graph_opt` (same model, data and
+hyperparameters; one microbatch of 16 x 2048 tokens per rank) reaches
+**78.3k tok/s/TC, 30.3% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
+27.2% for `hf_esmc_mlm_uniref50_graph` on the same host; 600-step UniRef50
+loss 2.5484 vs 2.5488 (seed 42), with matching grad-norm curves. Cumulative,
+100-step runs:
+
+| change | tok/s per TC | MFU |
+|---|---:|---:|
+| `hf_esmc_mlm_uniref50_graph` | 70.8k | 27.4% |
+| + forward softmax with a fixed max (`sa_max_logit_const=0`) | 72.1k | 27.9% |
+| + `xla_tpu_scoped_vmem_limit_kib=65536` | 73.3k | 28.4% |
+| + compact logsumexp residual, LP scheduler for the dkv kernel | 74.5k | 28.9% |
+| + `esmc_materialize_layernorms` | 75.4k | 29.2% |
+| + `optimizer_in_graph` (fwd + bwd + clip + AdamW in one program) | 77.0k | 29.8% |
+| + `esmc_fold_segment_mask` | **78.2k** | **30.3%** |
+| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | **88.9k** | **34.5%** |
+
+`hf_esmc600m_mlm_uniref50_graph_opt_pstate7` adds TPU7x performance state 7
+(`tpu_flags.TPU7X_THROUGHPUT_P_STATE`): a higher clock with the same compiled
+program and identical losses. MFU is still computed against the nominal peak,
+so that last row's gain is clock, not kernel efficiency. TPU7x only.
+
+One host, either variant:
+
+```bash
+TORCH_TPU_TIER2_COMPILATION_CACHE=$USER \
+torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
+  --module=torchtitan.experiments.tpu.transformers_modeling_backend \
+  --config=hf_esmc600m_mlm_uniref50_graph_opt \
+  --hf_assets_path=$ASSETS/esmc_tokenizer \
+  --dataloader.dataset_path=$DATA/uniref50 \
+  --training.steps=600 \
+  --checkpoint.no-enable
+# p-state 7: --config=hf_esmc600m_mlm_uniref50_graph_opt_pstate7
+```
+
+- **Fixed softmax max** (`sa_max_logit_const`): drops the running row max and
+  its rescale from the forward kernel. Relies on QK-LayerNorm bounding the
+  logits to fp32 `exp2`'s range (roughly [-87, 88]).
+- **Compact logsumexp** (always on): the forward writes its residual as
+  `(H, 1, S)` instead of a 128-lane-replicated `(H, S, 128)` f32 buffer the
+  backward had to relayout; the dkv kernel now also gets the LP LLO scheduler
+  the forward uses (`use_experimental_scheduler`).
+- **Materialized LayerNorms**: an optimization barrier on each block's two
+  LayerNorm outputs (and their gradients) stops XLA from recomputing the
+  LayerNorm in the prologue of every matmul tile that reads it.
+- **`optimizer_in_graph`**: removes the separate grad-norm / AdamW programs
+  and their per-step dispatch gaps. Supports **one microbatch per optimizer
+  step only** (it raises otherwise), so it does not apply to the 4.19M-token
+  8x-accumulation recipe. It also skips the host-side non-finite loss check.
+- **Folded segment mask** (`esmc_fold_segment_mask`): head_dim 64 already
+  occupies 128-lane tiles. The fused QK prologue writes `onehot(document)` into
+  q's spare 64 lanes and `0` / `-2^14` (same / other document) into k's, so
+  `q . k` is unchanged within a protein and `-2^14` lower across proteins
+  (`exp` underflows to exactly 0). Splash then runs without segment ids (no
+  per-element compare/select).
+
+> **Production caveat -- 63 documents per row.** The folded mask encodes at
+> most 64 segments per 2048-token row (63 documents plus the padding tail).
+> The config therefore caps the row packer at
+> `dataloader.max_documents_per_row = 63`, and the job config rejects
+> `esmc_fold_segment_mask` without that cap. On this recipe's UniRef50 subset
+> (the first 4M FASTA records, which are the *longest* proteins, median
+> ~650-1,960 residues) rows hold at most 3 documents, so the cap never binds.
+> On full UniRef50 (median ~250 residues) or short-peptide / fragment data,
+> rows that reach 63 documents close early and pad, which costs tokens and
+> changes the packing relative to the uncapped baseline; the gain from this
+> step (+1.6%) should be re-measured on production data before relying on it.
+> Data with many sub-32-residue sequences should not use it.
+
 ## Data
 
 ```bash

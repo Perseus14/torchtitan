@@ -400,6 +400,60 @@ def hf_esmc_mlm_uniref50_graph() -> TPUTransformersBackendConfig:
   return cfg
 
 
+def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
+  """ESMC-600M ``hf_esmc_mlm_uniref50_graph`` with the 30%-MFU optimizations.
+
+  Same model, data and hyperparameters, one microbatch of 16 x 2048 tokens per
+  rank. Measured on one tpu7x-8 host (8 TensorCores, torch_tpu 0.2.0): 78.3k
+  tok/s/TC, 30.3% MFU, vs 70.2k / 27.2% for ``hf_esmc_mlm_uniref50_graph``;
+  600-step UniRef50 loss 2.5484 vs 2.5488. On top of the graph config:
+
+  - ``sa_max_logit_const=0``: forward softmax with a fixed max (logits are
+    bounded by QK-LayerNorm).
+  - ``xla_tpu_scoped_vmem_limit_kib=65536``.
+  - ``optimizer_in_graph``: fwd + bwd + clip + AdamW as one program. One
+    microbatch per optimizer step only (not the 4.19M-token 8x-accum recipe).
+  - ``esmc_materialize_layernorms``.
+  - ``esmc_fold_segment_mask``: the document mask rides in q/k's padding
+    lanes. Caps rows at 63 documents (``max_documents_per_row``); rows holding
+    more proteins (e.g. short-protein data) close early and pad.
+  """
+  from torchtitan.experiments.tpu import tpu_flags  # pylint: disable=g-import-not-at-top
+  from .job_config import ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW  # pylint: disable=g-import-not-at-top
+
+  cfg = hf_esmc_mlm_uniref50_graph()
+  cfg.hf_model = "biohub/ESMC-600M"
+  cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 2048
+  cfg.splash_attention_kernel.sa_max_logit_const = 0.0
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, xla_tpu_scoped_vmem_limit_kib=65536
+  )
+  cfg.tpu_config.compile_grad_norm = False
+  cfg.tpu_config.compile_optimizer = False
+  cfg.tpu_config.optimizer_in_graph = True
+  cfg.esmc_materialize_layernorms = True
+  cfg.esmc_fold_segment_mask = True
+  cfg.dataloader.max_documents_per_row = ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW
+  return cfg
+
+
+def hf_esmc600m_mlm_uniref50_graph_opt_pstate7() -> TPUTransformersBackendConfig:
+  """``hf_esmc600m_mlm_uniref50_graph_opt`` at TPU7x performance state 7.
+
+  Adds ``xla_tpu_dvfs_p_state=7`` (``tpu_flags.TPU7X_THROUGHPUT_P_STATE``), the
+  throughput-oriented operating point: a higher clock, same compiled program
+  and numerics. MFU is still reported against the nominal peak, so part of the
+  gain is clock rather than efficiency. TPU7x only.
+  """
+  from torchtitan.experiments.tpu import tpu_flags  # pylint: disable=g-import-not-at-top
+
+  cfg = hf_esmc600m_mlm_uniref50_graph_opt()
+  cfg.libtpu_init_flags = tpu_flags.merge_flags(
+      cfg.libtpu_init_flags, tpu_flags.TPU7X_THROUGHPUT_P_STATE
+  )
+  return cfg
+
+
 def hf_esmc600m_mlm_uniref50_tpu7x16() -> TPUTransformersBackendConfig:
   """ESMC-600M at the paper's 4.19M-token step on an 8-chip ``tpu7x-16`` slice.
 
@@ -477,4 +531,6 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   config.tpu_config.compile_optimizer = False
   config.tpu_config.optimizer_in_graph = False
   config.esmc_fused_qk_norm_rope = False
+  config.esmc_materialize_layernorms = False
+  config.esmc_fold_segment_mask = False
   return config

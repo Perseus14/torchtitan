@@ -66,6 +66,7 @@ _SBD_KERNEL_KWARGS = {
     "use_document_aware_block_skipping": "document_aware_skipping",
     "use_base2_exp": "use_base2_exp",
     "use_experimental_scheduler": "use_experimental_scheduler",
+    "max_logit_const": "max_logit_const",
 }
 # Keys in ``_reported`` that are informational (the kernel ran); everything
 # else in that set is a fallback reason. Tests read this.
@@ -262,6 +263,9 @@ def _segment_ids(module, attention_mask, kwargs) -> torch.Tensor | None:
     plain causal / full mask with no segment pass at all.
     """
     seg = None
+    if kwargs.get("tpu_segment_mask_folded"):
+        # q/k carry the document mask in their padding lanes.
+        return None
     if _document_masked(module):
         seg = kwargs.get("tpu_segment_ids")
         if seg is None:

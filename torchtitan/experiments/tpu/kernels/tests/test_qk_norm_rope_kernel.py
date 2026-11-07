@@ -257,6 +257,62 @@ class QkNormRopeKernelTest(parameterized.TestCase):
       )
       self.assertLessEqual(rel_err, tol, msg=f"Mismatch in {name}: {rel_err}")
 
+  def test_folded_segment_lanes_match_plain_outputs(self):
+    """Widened q/k carry the plain heads plus an exact document mask."""
+    batch, seq, heads, head_dim, block_s = 2, 32, 4, 64, 16
+    hidden_dim = heads * head_dim
+    keys = jax.random.split(jax.random.PRNGKey(0), 8)
+    xq, xk, xv = (
+        jax.random.normal(keys[i], (batch, seq, hidden_dim)).astype(jnp.bfloat16)
+        for i in range(3)
+    )
+    wq = (1.0 + 0.1 * jax.random.normal(keys[3], (hidden_dim,))).astype(jnp.bfloat16)
+    wk = (1.0 + 0.1 * jax.random.normal(keys[4], (hidden_dim,))).astype(jnp.bfloat16)
+    angles = jax.random.uniform(keys[5], (1, seq, head_dim // 2), minval=-3.0, maxval=3.0)
+    emb = jnp.concatenate([angles, angles], axis=-1)
+    cos, sin = jnp.cos(emb).astype(jnp.bfloat16), jnp.sin(emb).astype(jnp.bfloat16)
+    # Row 0: documents of 10 / 12 / 10 tokens; row 1: one document + padding.
+    rel = jnp.array(
+        [[0] * 10 + [1] * 12 + [2] * 10, [0] * 20 + [1] * 12], jnp.int32
+    )[..., None]
+    common = dict(heads=heads, eps=1e-5, q_scale=0.125, block_s=block_s,
+                  interpret=True)
+
+    q, k, v = kernel.qk_norm_rope_fwd(xq, xk, xv, wq, wk, cos, sin, **common)
+    qa, ka, va = kernel.qk_norm_rope_fwd(
+        xq, xk, xv, wq, wk, cos, sin, segment_rel=rel, **common
+    )
+    self.assertEqual(qa.shape, (batch, heads, seq, 128))
+    np.testing.assert_array_equal(np.asarray(qa[..., :head_dim]), np.asarray(q))
+    np.testing.assert_array_equal(np.asarray(ka[..., :head_dim]), np.asarray(k))
+    np.testing.assert_array_equal(np.asarray(va), np.asarray(v))
+    # Segment lanes alone: 0 within a document, -2^14 across documents.
+    extra = jnp.einsum(
+        "bhsd,bhtd->bhst",
+        qa[..., head_dim:].astype(jnp.float32),
+        ka[..., head_dim:].astype(jnp.float32),
+    )
+    same = rel[:, None, :, 0][..., :, None] == rel[:, None, :, 0][..., None, :]
+    np.testing.assert_array_equal(
+        np.asarray(extra),
+        np.broadcast_to(np.where(np.asarray(same), 0.0, -(2.0**14)), extra.shape),
+    )
+
+    # Backward: widened gradients (garbage in the segment lanes) give the
+    # same input gradients as the plain head lanes.
+    gq = jax.random.normal(keys[6], (batch, heads, seq, head_dim)).astype(jnp.bfloat16)
+    gk = jax.random.normal(keys[7], (batch, heads, seq, head_dim)).astype(jnp.bfloat16)
+    noise = jnp.full((batch, heads, seq, 128 - head_dim), 7.0, jnp.bfloat16)
+    bwd = dict(eps=1e-5, q_scale=0.125, block_s=block_s, interpret=True)
+    plain = kernel.qk_norm_rope_bwd(xq, xk, wq, wk, cos, sin, gq, gk, v, **bwd)
+    widened = kernel.qk_norm_rope_bwd(
+        xq, xk, wq, wk, cos, sin,
+        jnp.concatenate([gq, noise], -1), jnp.concatenate([gk, noise], -1), v,
+        **bwd,
+    )
+    for got, want in zip(widened, plain):
+      np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
 
 if __name__ == "__main__":
   absltest.main()

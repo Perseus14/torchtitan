@@ -4,6 +4,10 @@ import dataclasses
 
 from torchtitan.experiments.tpu.tpu_job_config import TPUTrainerConfig
 
+# The folded segment mask has 128 - 64 = 64 spare lanes: one is the padding
+# tail's segment, the rest are documents.
+ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW = 63
+
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TPUTransformersBackendConfig(TPUTrainerConfig):
@@ -33,3 +37,35 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   # norm / relayout-copy / RoPE passes. Read by the model config's
   # ``update_from_config`` and carried as ``tpu_fused_qk_norm_rope``.
   esmc_fused_qk_norm_rope: bool = False
+  # ESM-C only: store each block's input_layernorm / post_attention_layernorm
+  # output once (an XLA optimization barrier) instead of letting XLA re-run
+  # the LayerNorm as the prologue of every matmul tile that reads it.
+  esmc_materialize_layernorms: bool = False
+  # ESM-C only, needs ``esmc_fused_qk_norm_rope``: fold the packed-document
+  # mask into the 64 padding lanes of q/k (written by the fused prologue), so
+  # splash attention runs without segment ids. Encodes at most 64 segments per
+  # row (documents plus the padding tail), so the packer must cap documents per
+  # row: requires ``dataloader.pack_rows_to_context`` and
+  # ``dataloader.max_documents_per_row <= ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW``.
+  esmc_fold_segment_mask: bool = False
+
+  def __post_init__(self):
+    super(TPUTransformersBackendConfig, self).__post_init__()
+    if self.esmc_fold_segment_mask:
+      if not self.esmc_fused_qk_norm_rope:
+        raise ValueError(
+            "esmc_fold_segment_mask requires esmc_fused_qk_norm_rope (the "
+            "fused prologue writes the folded q/k lanes)"
+        )
+      cap = getattr(self.dataloader, "max_documents_per_row", None)
+      if not getattr(self.dataloader, "pack_rows_to_context", False) or (
+          cap is None or cap > ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW
+      ):
+        raise ValueError(
+            "esmc_fold_segment_mask encodes at most "
+            f"{ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW + 1} segments per 2048-token "
+            "row (documents plus the padding tail); set "
+            "--dataloader.pack_rows_to_context and "
+            "--dataloader.max_documents_per_row <= "
+            f"{ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW} (got {cap})"
+        )

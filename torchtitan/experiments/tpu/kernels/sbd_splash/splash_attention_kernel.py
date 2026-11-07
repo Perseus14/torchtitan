@@ -200,6 +200,14 @@ class SplashConfig:
   fuse_reciprocal: bool = True  # whether to compute o / lse inside the kernel
   use_base2_exp: bool = True
   max_logit_const: float | None = None
+  # Write the forward logsumexp residual as a compact lane-major
+  # (num_q_heads, 1, q_seq_len) array instead of the lane-replicated
+  # (num_q_heads, q_seq_len, 128) one, so the backward does not need a strided
+  # relayout of 128x the data. Values are identical.
+  compact_lse: bool = False
+  # Use the LP LLO scheduler for the dkv kernel as well (the forward already
+  # follows `use_experimental_scheduler`). Scheduling only.
+  dkv_experimental_scheduler: bool = False
   interpret: bool = False
   # The fused bwd kernel accumulates dq at every grid step. To safely avoid
   # read/write conflicts we conservatively avoid *any* in-kernel reductions.
@@ -1078,10 +1086,17 @@ def flash_attention_kernel(
     else:
       o_ref[...] = o_scratch_ref[...].astype(o_ref.dtype)
     if logsumexp_ref is not None:
-      assert logsumexp_ref.shape == (num_stacked_q_heads, bq, NUM_LANES)
       log = jnp.log2 if config.use_base2_exp else jnp.log
       logsumexp = m + log(l)
-      logsumexp_ref[...] = logsumexp.astype(logsumexp_ref.dtype)
+      if config.compact_lse:
+        assert logsumexp_ref.shape == (num_stacked_q_heads, 1, bq)
+        for hs in range(num_stacked_q_heads):
+          # Every lane holds the same value; transpose and keep one row.
+          logsumexp_ref[hs] = (
+              logsumexp[hs].T[0:1, :].astype(logsumexp_ref.dtype))
+      else:
+        assert logsumexp_ref.shape == (num_stacked_q_heads, bq, NUM_LANES)
+        logsumexp_ref[...] = logsumexp.astype(logsumexp_ref.dtype)
     if l_linear_ref is not None:
       assert l_linear_ref.shape == (num_stacked_q_heads, bq, NUM_LANES)
       l_linear_ref[...] = l.astype(l_linear_ref.dtype)
@@ -1442,9 +1457,14 @@ def _splash_attention_forward(
     # can opt out.
     need_max_logits = save_max_logits or not fuse_reciprocal
 
+    lse_shape = (
+        (num_q_heads, 1, q_seq_len)
+        if config.compact_lse
+        else (num_q_heads, q_seq_len, NUM_LANES)
+    )
     out_shapes += [
         # logsumexp
-        jax.ShapeDtypeStruct((num_q_heads, q_seq_len, NUM_LANES), jnp.float32)
+        jax.ShapeDtypeStruct(lse_shape, jnp.float32)
         if fuse_reciprocal
         else None,
         # l_linear
@@ -1457,8 +1477,15 @@ def _splash_attention_forward(
         else None,
     ]
     out_specs += [
-        pl.BlockSpec(
-            (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
+        (
+            pl.BlockSpec(
+                (num_stacked_q_heads, 1, bq),
+                unravel(lambda h_block, i, j, *_: (h_block, 0, i)),
+            )
+            if config.compact_lse
+            else pl.BlockSpec(
+                (num_stacked_q_heads, bq, NUM_LANES), logsumexp_index_map
+            )
         )
         if fuse_reciprocal
         else None,
@@ -1634,7 +1661,10 @@ def _splash_attention_forward(
 
     if fuse_reciprocal:
       assert logsumexp is not None
-      logsumexp = init_if_empty(logsumexp[..., 0], mask_value)
+      if config.compact_lse:
+        logsumexp = init_if_empty(logsumexp[:, 0, :], mask_value)
+      else:
+        logsumexp = init_if_empty(logsumexp[..., 0], mask_value)
     else:
       assert l_linear is not None
       log = jnp.log2 if config.use_base2_exp else jnp.log
@@ -3099,7 +3129,12 @@ def _splash_attention_bwd_dkv(
         #     megacore
         # 3) for q_seq_len, we are reducing over it to compute dkv
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",) * len(grid)
+            dimension_semantics=("arbitrary",) * len(grid),
+            flags=(
+                {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True}
+                if config.dkv_experimental_scheduler
+                else None
+            ),
         ),
         name=kernel_name,
         cost_estimate=cost_estimate,

@@ -147,6 +147,12 @@ class TPUHFTransformerModel(HFTransformerModel):
       self._titan_injected_model_args["tpu_fused_qk_norm_rope"] = bool(
           getattr(config, "esmc_fused_qk_norm_rope", False)
       )
+      self._titan_injected_model_args["tpu_materialize_layernorms"] = bool(
+          getattr(config, "esmc_materialize_layernorms", False)
+      )
+      self._titan_injected_model_args["tpu_fold_segment_mask"] = bool(
+          getattr(config, "esmc_fold_segment_mask", False)
+      )
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       self._complete_from_hf_config(hf_model_id)
 
@@ -1049,6 +1055,7 @@ class _EsmcTPUAttention(nn.Module):
       xk: torch.Tensor,
       xv: torch.Tensor,
       position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+      segment_rel: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float | None] | None:
     """`(q, k, v, scaling)` heads-first from the fused Pallas prologue, or None.
 
@@ -1100,6 +1107,7 @@ class _EsmcTPUAttention(nn.Module):
         heads=self.config.num_attention_heads,
         eps=self.q_norm.eps,
         q_scale=q_scale,
+        segment_rel=segment_rel,
     )
     return query, key, value, scaling
 
@@ -1150,9 +1158,16 @@ class _EsmcTPUAttention(nn.Module):
     xv = self.v_proj(hidden_states)
 
     scaling = self.scaling
-    fused = self._fused_prologue(xq, xk, xv, position_embeddings)
+    segment_rel = _folded_segment_rel(self, kwargs)
+    fused = self._fused_prologue(
+        xq, xk, xv, position_embeddings, segment_rel=segment_rel
+    )
     if fused is not None:
       query, key, value, scaling = fused
+      if segment_rel is not None:
+        # The document mask now rides in q/k's padding lanes.
+        kwargs = dict(kwargs, tpu_segment_mask_folded=True)
+        kwargs.pop("tpu_segment_ids", None)
     else:
       assert position_embeddings is not None
       query, key, value = self._xla_prologue(xq, xk, xv, position_embeddings)
@@ -1170,11 +1185,74 @@ class _EsmcTPUAttention(nn.Module):
     return self.o_proj(attn_output.reshape(*input_shape, -1)), attn_weights
 
 
+def _folded_segment_rel(attn: nn.Module, kwargs) -> torch.Tensor | None:
+  """`(B, S, 1)` document index within each row for the folded segment mask.
+
+  Opt-in (`--esmc_fold_segment_mask`, carried as `tpu_fold_segment_mask`); only
+  for head_dim 64, where the 64 spare lanes of each 128-lane tile hold a
+  one-hot segment code. The job config requires the row packer to cap
+  documents per row so that every row's segment index stays below 64.
+  """
+  if not getattr(attn.config, "tpu_fold_segment_mask", False):
+    return None
+  if attn.head_dim != 64:
+    raise ValueError(
+        f"esmc_fold_segment_mask needs head_dim 64, got {attn.head_dim}"
+    )
+  seg = kwargs.get("tpu_segment_ids")
+  if seg is None or seg.ndim != 2:
+    raise ValueError(
+        "esmc_fold_segment_mask needs per-row (B, S) tpu_segment_ids"
+    )
+  # Segment ids grow monotonically along each row; index them from the row's
+  # first segment. The packer cap keeps the index below 64 (documents plus the
+  # padding tail), so the remainder is an identity on valid inputs.
+  rel = torch.remainder(seg - seg[:, :1], 64).to(torch.int32)
+  return rel[..., None]
+
+
+class _MaterializeBarrier(torch.autograd.Function):
+  """Identity whose output (and gradient) XLA must materialize.
+
+  An XLA optimization barrier on the value in forward and on its gradient in
+  backward: the producer cannot be fused into its consumers, so e.g. a
+  LayerNorm is computed once instead of being recomputed as the prologue of
+  every matmul tile that reads it. Values are unchanged bit for bit.
+  """
+
+  @staticmethod
+  def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+    return torch.tpu.ops.optimization_barrier([x])[0]
+
+  @staticmethod
+  def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+    return torch.tpu.ops.optimization_barrier([grad])[0]
+
+
+def _materialize_output(module: nn.Module) -> None:
+  """Wraps ``module.forward`` so its output passes `_MaterializeBarrier`."""
+  from torchtitan.experiments.tpu.graph_trainer import tpu_backend_pass  # pylint: disable=g-import-not-at-top
+  tpu_backend_pass._ensure_optimization_barrier_fake()  # pylint: disable=protected-access
+  inner = module.forward
+
+  def forward(*args, **kwargs):
+    out = inner(*args, **kwargs)
+    return _MaterializeBarrier.apply(out) if out.device.type == "tpu" else out
+
+  module.forward = forward
+
+
 def _use_tpu_esmc_attention(model: nn.Module) -> None:
   """Swaps every ``EsmcAttention`` in ``model`` for ``_EsmcTPUAttention``."""
+  materialize = getattr(
+      getattr(model, "config", None), "tpu_materialize_layernorms", False
+  )
   for module in model.modules():
     if type(module).__name__ == "EsmcAttention" and getattr(module, "head_dim", 0) % 2 == 0:
       _EsmcTPUAttention.install(module)
+    if type(module).__name__ == "EsmcLayer" and materialize:
+      _materialize_output(module.input_layernorm)
+      _materialize_output(module.post_attention_layernorm)
 
 
 def as_tpu_model_config(

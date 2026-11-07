@@ -184,7 +184,43 @@ def _get_pallas_ops():
     return dxq, dxk, dxv, dwq, dwk, None, None, None, None, None, None
 
   fwd_op.register_autograd(_backward, setup_context=_setup_context)
-  return fwd_op, bwd_op
+
+  def _fwd_seg_jax(
+      xq: jax.Array,
+      xk: jax.Array,
+      xv: jax.Array,
+      wq: jax.Array,
+      wk: jax.Array,
+      cos: jax.Array,
+      sin: jax.Array,
+      segment_rel: jax.Array,
+      heads: int,
+      eps: float,
+      q_scale: float,
+      block_s: int,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return kernel.qk_norm_rope_fwd(
+        xq, xk, xv, wq, wk, cos, sin, heads=heads, eps=eps, q_scale=q_scale,
+        block_s=block_s, segment_rel=segment_rel,
+    )
+
+  fwd_seg_op = pallas.jax_op("pallas::qk_norm_rope_seg_fwd", _fwd_seg_jax)
+
+  def _setup_context_seg(ctx, inputs, output):
+    del output
+    xq, xk, _, wq, wk, cos, sin, _, _, eps, q_scale, block_s = inputs
+    ctx.save_for_backward(xq, xk, wq, wk, cos, sin)
+    ctx.eps = eps
+    ctx.q_scale = q_scale
+    ctx.block_s = block_s
+
+  def _backward_seg(ctx, gq, gk, gv):
+    grads = _backward(ctx, gq, gk, gv)
+    # Insert the (non-differentiable) segment_rel slot after sin.
+    return grads[:7] + (None,) + grads[7:]
+
+  fwd_seg_op.register_autograd(_backward_seg, setup_context=_setup_context_seg)
+  return fwd_op, bwd_op, fwd_seg_op
 
 
 def fused_qk_norm_rope(
@@ -200,8 +236,13 @@ def fused_qk_norm_rope(
     eps: float,
     q_scale: float = 1.0,
     block_s: int = DEFAULT_BLOCK_S,
+    segment_rel: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Runs the fused QK-LayerNorm + `rotate_half` RoPE + heads-first prologue.
+
+  With `segment_rel` (`(B, S, 1)` int32 document index within each row), q and
+  k are returned widened to 128 lanes with the document mask folded into
+  their padding lanes; the attention then runs without segment ids.
 
   Args:
     xq, xk, xv: `(B, S, H*D)` query, key, and value projection outputs on TPU.
@@ -239,7 +280,22 @@ def fused_qk_norm_rope(
     )
   bs = pick_seq_block(xq.shape[1], block_s)
   assert bs is not None
-  fwd_op, _ = _get_pallas_ops()
+  fwd_op, _, fwd_seg_op = _get_pallas_ops()
+  if segment_rel is not None:
+    return fwd_seg_op(
+        xq.contiguous(),
+        xk.contiguous(),
+        xv.contiguous(),
+        wq.contiguous(),
+        wk.contiguous(),
+        cos.contiguous(),
+        sin.contiguous(),
+        segment_rel.contiguous(),
+        int(heads),
+        float(eps),
+        float(q_scale),
+        int(bs),
+    )
   return fwd_op(
       xq.contiguous(),
       xk.contiguous(),

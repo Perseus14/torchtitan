@@ -169,6 +169,22 @@ def _pack_heads_to_group(
   return parts[0] if heads_per_group == 1 else jnp.concatenate(parts, axis=-1)
 
 
+def _segment_lanes_tiles(seg_ref, bs: int, head_dim: int, big: float):
+  """`(q_extra, k_extra)` `(bs, 128)` f32 tiles for the folded segment mask.
+
+  Lanes `head_dim..127` carry ``onehot(doc)`` for q and ``0`` (same doc) /
+  ``-big`` (other doc) for k, so ``q_aug . k_aug = q . k - big * [doc_q !=
+  doc_k]`` with the extra products exact. Lanes below `head_dim` are unused
+  here (the caller selects the real head values there).
+  """
+  lane = jax.lax.broadcasted_iota(jnp.int32, (bs, NUM_LANES), 1)
+  rel = seg_ref[0]  # (bs, 1) int32: document index within the row
+  hit = (lane - head_dim) == rel
+  q_extra = jnp.where(hit, 1.0, 0.0).astype(jnp.float32)
+  k_extra = jnp.where(hit, 0.0, -big).astype(jnp.float32)
+  return lane, q_extra, k_extra
+
+
 def _qk_norm_rope_fwd_kernel(
     xq_ref,
     xk_ref,
@@ -177,15 +193,17 @@ def _qk_norm_rope_fwd_kernel(
     wk_ref,
     cos_ref,
     sin_ref,
-    oq_ref,
-    ok_ref,
-    ov_ref,
-    *,
+    *refs,
     heads: int,
     head_dim: int,
     eps: float,
     q_scale: float,
+    seg_big: float | None = None,
 ):
+  if seg_big is not None:
+    seg_ref, oq_ref, ok_ref, ov_ref = refs
+  else:
+    oq_ref, ok_ref, ov_ref = refs
   bs = xq_ref.shape[1]
   group_width = lane_group_width(head_dim)
   heads_per_group = group_width // head_dim
@@ -200,9 +218,12 @@ def _qk_norm_rope_fwd_kernel(
   )
   sin_signed = jnp.where(first_half, -sin, sin)
 
-  for x_ref, w_ref, o_ref, scale in (
-      (xq_ref, wq_ref, oq_ref, q_scale),
-      (xk_ref, wk_ref, ok_ref, 1.0),
+  if seg_big is not None:
+    assert head_dim * 2 == NUM_LANES and heads_per_group == 2
+    lane, q_extra, k_extra = _segment_lanes_tiles(seg_ref, bs, head_dim, seg_big)
+  for x_ref, w_ref, o_ref, scale, extra in (
+      (xq_ref, wq_ref, oq_ref, q_scale, None if seg_big is None else q_extra),
+      (xk_ref, wk_ref, ok_ref, 1.0, None if seg_big is None else k_extra),
   ):
     x = x_ref[0].astype(jnp.float32)
     mu, rstd = _layernorm_row_stats(x, eps)
@@ -219,6 +240,16 @@ def _qk_norm_rope_fwd_kernel(
       if scale != 1.0:
         out = out * scale
       out = out.astype(o_ref.dtype)
+      if extra is not None:
+        # Head 0 of the group already sits in lanes [0, 64); head 1 is rolled
+        # down from [64, 128). The upper half carries the segment lanes.
+        low = lane < head_dim
+        o_ref[0, gi * 2] = jnp.where(
+            low, out.astype(jnp.float32), extra).astype(o_ref.dtype)
+        o_ref[0, gi * 2 + 1] = jnp.where(
+            low, pltpu.roll(out.astype(jnp.float32), head_dim, 1), extra
+        ).astype(o_ref.dtype)
+        continue
       for j in range(heads_per_group):
         o_ref[0, gi * heads_per_group + j] = out[
             :, j * head_dim : (j + 1) * head_dim
@@ -288,7 +319,15 @@ def _qk_norm_rope_bwd_kernel(
     group_terms = []
     for gi in range(n_groups):
       sl = slice(gi * group_width, (gi + 1) * group_width)
-      grad_out = _pack_heads_to_group(g_ref, gi, heads_per_group, to_f32=True)
+      if g_ref.shape[-1] != head_dim:
+        # Widened (segment-lanes) gradients: the real head values sit in
+        # lanes [0, head_dim) of each head; the segment lanes get no grad.
+        lane_g = jax.lax.broadcasted_iota(jnp.int32, (bs, NUM_LANES), 1)
+        g0 = g_ref[0, gi * 2].astype(jnp.float32)
+        g1 = g_ref[0, gi * 2 + 1].astype(jnp.float32)
+        grad_out = jnp.where(lane_g < head_dim, g0, pltpu.roll(g1, head_dim, 1))
+      else:
+        grad_out = _pack_heads_to_group(g_ref, gi, heads_per_group, to_f32=True)
       if scale != 1.0:
         grad_out = grad_out * scale
       # Exact VJP of `n * cos + rotate_partner(n) * sin_signed` for any (cos, sin):
@@ -390,8 +429,14 @@ def qk_norm_rope_fwd(
     block_s: int = DEFAULT_BLOCK_S,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     interpret: bool = False,
+    segment_rel: jax.Array | None = None,
+    seg_big: float = 2.0**14,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Fused forward: `(B, S, H*D)` projections -> heads-first `(B, H, S, D)`.
+
+  With `segment_rel` (`(B, S, 1)` int32 document index within each row, below
+  `128 - D`), q and k come back widened to `(B, H, S, 128)` with the document
+  mask folded into their padding lanes (see `_segment_lanes_tiles`).
 
   Args:
     xq, xk, xv: `(B, S, H*D)` query, key, and value projection outputs.
@@ -418,22 +463,36 @@ def qk_norm_rope_fwd(
   row, weight, rope_table, heads_first = _make_block_specs(
       hidden_dim, heads, head_dim, bs, cos_batched=cos.shape[0] > 1
   )
+  widened = segment_rel is not None
   kernel = functools.partial(
       _qk_norm_rope_fwd_kernel,
       heads=heads,
       head_dim=head_dim,
       eps=eps,
       q_scale=q_scale,
+      seg_big=seg_big if widened else None,
   )
-  out_shape = tuple(
-      jax.ShapeDtypeStruct((batch, heads, seq, head_dim), t.dtype)
-      for t in (xq, xk, xv)
+  qk_dim = NUM_LANES if widened else head_dim
+  out_shape = (
+      jax.ShapeDtypeStruct((batch, heads, seq, qk_dim), xq.dtype),
+      jax.ShapeDtypeStruct((batch, heads, seq, qk_dim), xk.dtype),
+      jax.ShapeDtypeStruct((batch, heads, seq, head_dim), xv.dtype),
   )
+  qk_spec = (
+      pl.BlockSpec((1, heads, bs, qk_dim), lambda b, s: (b, 0, s, 0))
+      if widened
+      else heads_first
+  )
+  in_specs = [row, row, row, weight, weight, rope_table, rope_table]
+  args = [xq, xk, xv, wq.reshape(1, hidden_dim), wk.reshape(1, hidden_dim), cos, sin]
+  if widened:
+    in_specs.append(pl.BlockSpec((1, bs, 1), lambda b, s: (b, s, 0)))
+    args.append(segment_rel.astype(jnp.int32))
   return pl.pallas_call(
       kernel,
       grid=(batch, seq // bs),
-      in_specs=[row, row, row, weight, weight, rope_table, rope_table],
-      out_specs=[heads_first, heads_first, heads_first],
+      in_specs=in_specs,
+      out_specs=[qk_spec, qk_spec, heads_first],
       out_shape=out_shape,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("parallel", "parallel"),
@@ -441,7 +500,7 @@ def qk_norm_rope_fwd(
       ),
       interpret=interpret,
       name="esmc_qk_norm_rope_fwd",
-  )(xq, xk, xv, wq.reshape(1, hidden_dim), wk.reshape(1, hidden_dim), cos, sin)
+  )(*args)
 
 
 def qk_norm_rope_bwd(
@@ -462,20 +521,23 @@ def qk_norm_rope_bwd(
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Fused backward returning `(dxq, dxk, dxv)` in `(B, S, H*D)` and `(dwq, dwk)`."""
-  if gq.ndim != 4 or gk.shape != gq.shape or gv.shape != gq.shape:
+  if gq.ndim != 4 or gk.shape != gq.shape or gv.shape[:3] != gq.shape[:3]:
     raise ValueError(
         f"Expected matching rank-4 heads-first gradients, got {gq.shape},"
         f" {gk.shape}, {gv.shape}"
     )
-  heads, head_dim = gq.shape[1], gq.shape[3]
+  # gq/gk may be widened to 128 lanes (segment lanes); v carries the head_dim.
+  heads, head_dim = gv.shape[1], gv.shape[3]
+  qk_dim = gq.shape[3]
   batch, seq, hidden_dim, bs = _check_common_inputs(
       xq, xk, wq, wk, cos, sin, heads=heads, head_dim=head_dim, block_s=block_s
   )
-  if gq.shape != (batch, heads, seq, head_dim):
+  if gq.shape != (batch, heads, seq, qk_dim) or qk_dim not in (head_dim, NUM_LANES):
     raise ValueError(
         f"Expected gradient shape {(batch, heads, seq, head_dim)}, got"
         f" {gq.shape}"
     )
+  g_qk_spec = pl.BlockSpec((1, heads, bs, qk_dim), lambda b, s: (b, 0, s, 0))
   row, weight, rope_table, heads_first = _make_block_specs(
       hidden_dim, heads, head_dim, bs, cos_batched=cos.shape[0] > 1
   )
@@ -508,8 +570,8 @@ def qk_norm_rope_bwd(
           weight,
           rope_table,
           rope_table,
-          heads_first,
-          heads_first,
+          g_qk_spec,
+          g_qk_spec,
           heads_first,
       ],
       out_specs=[row, row, row, dw_spec, dw_spec],

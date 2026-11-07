@@ -132,12 +132,18 @@ class QkNormRopeTest(
               "torch_tpu._internal.pallas": fake_pallas,
           },
       ):
-        fwd_op, _ = qk_norm_rope._get_pallas_ops()
+        fwd_op, _, fwd_seg_op = qk_norm_rope._get_pallas_ops()
         fwd_op.register_autograd.assert_called_once()
+        fwd_seg_op.register_autograd.assert_called_once()
     finally:
       qk_norm_rope._get_pallas_ops.cache_clear()
     self.assertEqual(
-        seen_names, ["pallas::qk_norm_rope_fwd", "pallas::qk_norm_rope_bwd"]
+        seen_names,
+        [
+            "pallas::qk_norm_rope_fwd",
+            "pallas::qk_norm_rope_bwd",
+            "pallas::qk_norm_rope_seg_fwd",
+        ],
     )
 
   def _run(self, fn, device, dtype, leaves, tables, grads):

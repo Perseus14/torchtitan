@@ -164,6 +164,11 @@ class RowAlignedPackingConfig:
   """
 
   dataset: DatasetConfig
+  max_documents_per_row: int | None = None
+
+  def __post_init__(self) -> None:
+    if self.max_documents_per_row is not None and self.max_documents_per_row <= 0:
+      raise ValueError("max_documents_per_row must be positive")
 
   def build(
       self,
@@ -180,15 +185,18 @@ class RowAlignedPackingConfig:
         dataset,
         max_context_length=context.max_context_length,
         num_tokens_per_batch=context.num_tokens_per_batch,
+        max_documents_per_row=self.max_documents_per_row,
     )
 
 
 class _RowAlignedPackingIterDataset(grain.IterDataset):
 
   def __init__(
-      self, parent: grain.IterDataset, *, max_context_length: int, num_tokens_per_batch: int
+      self, parent: grain.IterDataset, *, max_context_length: int, num_tokens_per_batch: int,
+      max_documents_per_row: int | None = None,
   ) -> None:
     super().__init__(parent)
+    self._max_documents_per_row = max_documents_per_row
     if num_tokens_per_batch % max_context_length:
       raise ValueError(
           f"num_tokens_per_batch={num_tokens_per_batch} must be a multiple of "
@@ -202,6 +210,7 @@ class _RowAlignedPackingIterDataset(grain.IterDataset):
         iter(self._parent),
         max_context_length=self._max_context_length,
         num_rows=self._num_rows,
+        max_documents_per_row=self._max_documents_per_row,
     )
 
 
@@ -217,11 +226,13 @@ class _RowAlignedPackingIterator(grain.DatasetIterator):
   """
 
   def __init__(
-      self, parent: grain.DatasetIterator, *, max_context_length: int, num_rows: int
+      self, parent: grain.DatasetIterator, *, max_context_length: int, num_rows: int,
+      max_documents_per_row: int | None = None,
   ) -> None:
     super().__init__(parent)
     self._max_context_length = max_context_length
     self._num_rows = num_rows
+    self._max_documents_per_row = max_documents_per_row
     self._pending: TextSequence | None = None
     self._pending_parent_state: dict[str, Any] | None = None
     self._pending_offset = 0
@@ -253,7 +264,14 @@ class _RowAlignedPackingIterator(grain.DatasetIterator):
       doc = self._pending
       assert doc is not None
       chunk_len = min(len(doc.input_ids) - self._pending_offset, ctx)
-      row = next((r for r in range(self._num_rows) if used[r] + chunk_len <= ctx), None)
+      cap = self._max_documents_per_row
+      row = next(
+          (
+              r for r in range(self._num_rows)
+              if used[r] + chunk_len <= ctx and (cap is None or len(rows[r]) < cap)
+          ),
+          None,
+      )
       if row is None:
         break
       chunk = slice(self._pending_offset, self._pending_offset + chunk_len)
@@ -361,15 +379,26 @@ class TPUGrainDataLoader(GrainDataLoader):
     # Keep every document inside one ``max_context_length`` row
     # (``RowAlignedPackingConfig``) instead of concatenating across rows.
     pack_rows_to_context: bool = False
+    # With ``pack_rows_to_context``: at most this many documents per row
+    # (None = no cap). A row that reaches the cap takes no more documents.
+    max_documents_per_row: int | None = None
 
   def __init__(self, config: Config, **kwargs: Any) -> None:
     if isinstance(config.dataset, str):
       if config.dataset in DATASETS:
-        packing = (
-            RowAlignedPackingConfig if config.pack_rows_to_context
-            else ConcatThenSplitPackingConfig
-        )
-        ds_cfg = packing(dataset=_text_dataset(config.dataset, config.dataset_path))
+        dataset = _text_dataset(config.dataset, config.dataset_path)
+        if config.pack_rows_to_context:
+          ds_cfg = RowAlignedPackingConfig(
+              dataset=dataset,
+              max_documents_per_row=config.max_documents_per_row,
+          )
+        elif config.max_documents_per_row is not None:
+          raise ValueError(
+              "dataloader.max_documents_per_row requires "
+              "dataloader.pack_rows_to_context"
+          )
+        else:
+          ds_cfg = ConcatThenSplitPackingConfig(dataset=dataset)
       else:
         from torchtitan.models.flux.flux_datasets import (  # pylint: disable=g-import-not-at-top
             DATASETS as FLUX_DATASETS,
