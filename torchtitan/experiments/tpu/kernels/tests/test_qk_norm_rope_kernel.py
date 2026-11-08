@@ -283,6 +283,13 @@ class QkNormRopeKernelTest(parameterized.TestCase):
         xq, xk, xv, wq, wk, cos, sin, segment_rel=rel, **common
     )
     self.assertEqual(qa.shape, (batch, heads, seq, 128))
+
+    # Odd heads hold their values in the upper lane half; swapping the halves
+    # of odd heads gives every head the [values | segment code] layout.
+    def canonical(t):
+      return t.at[:, 1::2].set(jnp.roll(t[:, 1::2], head_dim, axis=-1))
+
+    qa, ka = canonical(qa), canonical(ka)
     np.testing.assert_array_equal(np.asarray(qa[..., :head_dim]), np.asarray(q))
     np.testing.assert_array_equal(np.asarray(ka[..., :head_dim]), np.asarray(k))
     np.testing.assert_array_equal(np.asarray(va), np.asarray(v))
@@ -307,7 +314,8 @@ class QkNormRopeKernelTest(parameterized.TestCase):
     plain = kernel.qk_norm_rope_bwd(xq, xk, wq, wk, cos, sin, gq, gk, v, **bwd)
     widened = kernel.qk_norm_rope_bwd(
         xq, xk, wq, wk, cos, sin,
-        jnp.concatenate([gq, noise], -1), jnp.concatenate([gk, noise], -1), v,
+        canonical(jnp.concatenate([gq, noise], -1)),
+        canonical(jnp.concatenate([gk, noise], -1)), v,
         **bwd,
     )
     for got, want in zip(widened, plain):

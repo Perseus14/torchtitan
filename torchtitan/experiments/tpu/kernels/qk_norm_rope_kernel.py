@@ -182,14 +182,18 @@ def _pack_heads_to_group(
 def _segment_lanes_tiles(seg_ref, bs: int, head_dim: int, big: float):
   """`(q_extra, k_extra)` `(bs, 128)` f32 tiles for the folded segment mask.
 
-  Lanes `head_dim..127` carry ``onehot(doc)`` for q and ``0`` (same doc) /
-  ``-big`` (other doc) for k, so ``q_aug . k_aug = q . k - big * [doc_q !=
-  doc_k]`` with the extra products exact. Lanes below `head_dim` are unused
-  here (the caller selects the real head values there).
+  The `128 - head_dim` lanes that do not hold a head's values carry
+  ``onehot(doc)`` for q and ``0`` (same doc) / ``-big`` (other doc) for k, so
+  ``q_aug . k_aug = q . k - big * [doc_q != doc_k]`` with the extra products
+  exact. Both lane halves are filled; the caller selects the half that holds
+  the head's values.
   """
   lane = jax.lax.broadcasted_iota(jnp.int32, (bs, NUM_LANES), 1)
   rel = seg_ref[0]  # (bs, 1) int32: document index within the row
-  hit = (lane - head_dim) == rel
+  # Even heads keep their values in lanes [0, D) and the code in [D, 128); odd
+  # heads the other way round, so no head is lane-shifted (q . k sums over all
+  # 128 lanes, so where the values sit does not matter to the attention).
+  hit = jax.lax.rem(lane, head_dim) == rel
   q_extra = jnp.where(hit, 1.0, 0.0).astype(jnp.float32)
   k_extra = jnp.where(hit, 0.0, -big).astype(jnp.float32)
   return lane, q_extra, k_extra
@@ -251,14 +255,13 @@ def _qk_norm_rope_fwd_kernel(
         out = out * scale
       out = out.astype(o_ref.dtype)
       if extra is not None:
-        # Head 0 of the group already sits in lanes [0, 64); head 1 is rolled
-        # down from [64, 128). The upper half carries the segment lanes.
+        # Head 0 of the group sits in lanes [0, 64) and head 1 in [64, 128);
+        # each keeps its lanes and the other half carries the segment code.
         low = lane < head_dim
         o_ref[0, gi * 2] = jnp.where(
             low, out.astype(jnp.float32), extra).astype(o_ref.dtype)
         o_ref[0, gi * 2 + 1] = jnp.where(
-            low, pltpu.roll(out.astype(jnp.float32), head_dim, 1), extra
-        ).astype(o_ref.dtype)
+            low, extra, out.astype(jnp.float32)).astype(o_ref.dtype)
         continue
       for j in range(heads_per_group):
         o_ref[0, gi * heads_per_group + j] = out[
@@ -328,12 +331,13 @@ def _qk_norm_rope_bwd_kernel(
     for gi in range(n_groups):
       sl = slice(gi * group_width, (gi + 1) * group_width)
       if g_ref.shape[-1] != head_dim:
-        # Widened (segment-lanes) gradients: the real head values sit in
-        # lanes [0, head_dim) of each head; the segment lanes get no grad.
+        # Widened (segment-lanes) gradients: even heads' values sit in lanes
+        # [0, head_dim), odd heads' in [head_dim, 128) -- the group's layout,
+        # so no roll; the segment lanes get no grad.
         lane_g = jax.lax.broadcasted_iota(jnp.int32, (bs, NUM_LANES), 1)
         g0 = g_ref[0, gi * 2].astype(jnp.float32)
         g1 = g_ref[0, gi * 2 + 1].astype(jnp.float32)
-        grad_out = jnp.where(lane_g < head_dim, g0, pltpu.roll(g1, head_dim, 1))
+        grad_out = jnp.where(lane_g < head_dim, g0, g1)
       else:
         grad_out = _pack_heads_to_group(g_ref, gi, heads_per_group, to_f32=True)
       if scale != 1.0:
@@ -353,13 +357,14 @@ def _qk_norm_rope_bwd_kernel(
       else:
         acc_dxhat = acc_dxhat + dxhat
         acc_dxhat_xhat = acc_dxhat_xhat + dxhat * xhat
-      group_terms.append((sl, dxhat, xhat))
+      group_terms.append((sl, dxhat))
     inv_hidden = 1.0 / hidden_dim
     mean_dxhat = jnp.sum(acc_dxhat, axis=-1, keepdims=True) * inv_hidden
     mean_dxhat_xhat = (
         jnp.sum(acc_dxhat_xhat, axis=-1, keepdims=True) * inv_hidden
     )
-    for sl, dxhat, xhat in group_terms:
+    for sl, dxhat in group_terms:
+      xhat = (x[:, sl] - mu) * rstd
       dx_ref[0, :, sl] = (
           rstd * (dxhat - mean_dxhat - xhat * mean_dxhat_xhat)
       ).astype(dx_ref.dtype)
@@ -448,7 +453,8 @@ def qk_norm_rope_fwd(
 
   With `segment_rel` (`(B, S, 1)` int32 document index within each row, below
   `128 - D`), q and k come back widened to `(B, H, S, 128)` with the document
-  mask folded into their padding lanes (see `_segment_lanes_tiles`).
+  mask folded into their padding lanes (see `_segment_lanes_tiles`): even
+  heads hold their values in lanes `[0, D)`, odd heads in `[D, 128)`.
 
   Args:
     xq, xk, xv: `(B, S, H*D)` query, key, and value projection outputs.
