@@ -128,8 +128,10 @@ optimizations:
 hyperparameters; one microbatch of 16 x 2048 tokens per rank) reaches
 **85.3k tok/s/TC, 33.1% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
 27.2% for `hf_esmc_mlm_uniref50_graph` on the same host; 600-step UniRef50
-loss 2.5473 vs 2.5488 (seed 42), with matching grad-norm curves. Cumulative,
-100-step runs:
+loss 2.5473 vs 2.5488 (seed 42), with matching grad-norm curves. Details,
+numerics and dropped experiments: [MFU_REPORT.md](MFU_REPORT.md); profile
+headroom per component: [HEADROOM_ANALYSIS.md](HEADROOM_ANALYSIS.md).
+Cumulative, 100-step runs:
 
 | change | tok/s per TC | MFU |
 |---|---:|---:|
