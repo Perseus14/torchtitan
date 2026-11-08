@@ -404,8 +404,8 @@ def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
   """ESMC-600M ``hf_esmc_mlm_uniref50_graph`` with the MFU optimizations.
 
   Same model, data and hyperparameters, one microbatch of 16 x 2048 tokens per
-  rank. Measured on one tpu7x-8 host (8 TensorCores, torch_tpu 0.2.0): 84.6k
-  tok/s/TC, 32.8% MFU, vs 70.2k / 27.2% for ``hf_esmc_mlm_uniref50_graph``.
+  rank. Measured on one tpu7x-8 host (8 TensorCores, torch_tpu 0.2.0): 85.0k
+  tok/s/TC, 32.9% MFU, vs 70.2k / 27.2% for ``hf_esmc_mlm_uniref50_graph``.
   On top of the graph config:
 
   - ``sa_max_logit_const=0``: forward softmax with a fixed max (logits are

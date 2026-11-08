@@ -126,7 +126,7 @@ optimizations:
 
 `--config=hf_esmc600m_mlm_uniref50_graph_opt` (same model, data and
 hyperparameters; one microbatch of 16 x 2048 tokens per rank) reaches
-**84.6k tok/s/TC, 32.8% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
+**85.0k tok/s/TC, 32.9% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
 27.2% for `hf_esmc_mlm_uniref50_graph` on the same host; 600-step UniRef50
 loss 2.5473 vs 2.5488 (seed 42), with matching grad-norm curves. Cumulative,
 100-step runs:
@@ -143,8 +143,9 @@ loss 2.5473 vs 2.5488 (seed 42), with matching grad-norm curves. Cumulative,
 | + `xla_tpu_reduce_window_reduction_dim_max=0` | 81.1k | 31.4% |
 | + `esmc_swiglu_saved_sigmoid` | 82.5k | 32.0% |
 | - `esmc_materialize_layernorms` (no longer pays off) | 82.9k | 32.1% |
-| + fused QK prologue: one cross-lane reduce per row tile, `block_s` 1024 | **84.6k** | **32.8%** |
-| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | **96.2k** | **37.3%** |
+| + fused QK prologue: one cross-lane reduce per row tile, `block_s` 1024 | 84.6k | 32.8% |
+| + folded mask: odd heads keep their upper lanes (no lane roll) | **85.0k** | **32.9%** |
+| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | **96.6k** | **37.4%** |
 
 `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` adds TPU7x performance state 7
 (`tpu_flags.TPU7X_THROUGHPUT_P_STATE`): a higher clock with the same compiled
