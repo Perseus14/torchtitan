@@ -126,9 +126,9 @@ optimizations:
 
 `--config=hf_esmc600m_mlm_uniref50_graph_opt` (same model, data and
 hyperparameters; one microbatch of 16 x 2048 tokens per rank) reaches
-**78.3k tok/s/TC, 30.3% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
+**84.6k tok/s/TC, 32.8% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
 27.2% for `hf_esmc_mlm_uniref50_graph` on the same host; 600-step UniRef50
-loss 2.5484 vs 2.5488 (seed 42), with matching grad-norm curves. Cumulative,
+loss 2.5473 vs 2.5488 (seed 42), with matching grad-norm curves. Cumulative,
 100-step runs:
 
 | change | tok/s per TC | MFU |
@@ -139,8 +139,12 @@ loss 2.5484 vs 2.5488 (seed 42), with matching grad-norm curves. Cumulative,
 | + compact logsumexp residual, LP scheduler for the dkv kernel | 74.5k | 28.9% |
 | + `esmc_materialize_layernorms` | 75.4k | 29.2% |
 | + `optimizer_in_graph` (fwd + bwd + clip + AdamW in one program) | 77.0k | 29.8% |
-| + `esmc_fold_segment_mask` | **78.2k** | **30.3%** |
-| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | **88.9k** | **34.5%** |
+| + `esmc_fold_segment_mask` | 78.2k | 30.3% |
+| + `xla_tpu_reduce_window_reduction_dim_max=0` | 81.1k | 31.4% |
+| + `esmc_swiglu_saved_sigmoid` | 82.5k | 32.0% |
+| - `esmc_materialize_layernorms` (no longer pays off) | 82.9k | 32.1% |
+| + fused QK prologue: one cross-lane reduce per row tile, `block_s` 1024 | **84.6k** | **32.8%** |
+| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | **96.2k** | **37.3%** |
 
 `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` adds TPU7x performance state 7
 (`tpu_flags.TPU7X_THROUGHPUT_P_STATE`): a higher clock with the same compiled
@@ -168,9 +172,21 @@ torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
   `(H, 1, S)` instead of a 128-lane-replicated `(H, S, 128)` f32 buffer the
   backward had to relayout; the dkv kernel now also gets the LP LLO scheduler
   the forward uses (`use_experimental_scheduler`).
-- **Materialized LayerNorms**: an optimization barrier on each block's two
-  LayerNorm outputs (and their gradients) stops XLA from recomputing the
-  LayerNorm in the prologue of every matmul tile that reads it.
+- **Materialized LayerNorms** (`esmc_materialize_layernorms`, off in the
+  recipe): an optimization barrier on each block's two LayerNorm outputs (and
+  their gradients). It paid off while XLA rewrote the LayerNorm-backward row
+  reductions as reduce-windows; with the flag below it costs an extra HBM
+  round trip and 4.9 GiB.
+- **`xla_tpu_reduce_window_reduction_dim_max=0`**: keeps each LayerNorm-backward
+  row reduction a reduce + broadcast instead of a full-row (1x1x2303)
+  reduce-window over the 1152 hidden lanes.
+- **SwiGLU saves `sigmoid(gate)`** (`esmc_swiglu_saved_sigmoid`): the backward
+  needs only multiplies and adds in the down-projection dX epilogue.
+- **Fused QK prologue, one cross-lane reduce**: the LayerNorm statistics and
+  backward sums add the 128-lane groups elementwise first and reduce across
+  lanes once per row tile; LLO showed the kernel's critical path was cross-lane
+  (XLU) reductions and rotates. The smaller live set lets `block_s` grow to
+  1024 (64 MiB VMEM).
 - **`optimizer_in_graph`**: removes the separate grad-norm / AdamW programs
   and their per-step dispatch gaps. Supports **one microbatch per optimizer
   step only** (it raises otherwise), so it does not apply to the 4.19M-token

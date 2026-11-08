@@ -153,6 +153,9 @@ class TPUHFTransformerModel(HFTransformerModel):
       self._titan_injected_model_args["tpu_fold_segment_mask"] = bool(
           getattr(config, "esmc_fold_segment_mask", False)
       )
+      self._titan_injected_model_args["tpu_swiglu_saved_sigmoid"] = bool(
+          getattr(config, "esmc_swiglu_saved_sigmoid", False)
+      )
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       self._complete_from_hf_config(hf_model_id)
 
@@ -1229,6 +1232,38 @@ class _MaterializeBarrier(torch.autograd.Function):
     return torch.tpu.ops.optimization_barrier([grad])[0]
 
 
+class _SwiGLUSavedSigmoid(torch.autograd.Function):
+  """``silu(gate) * up`` that saves ``sigmoid(gate)`` for the backward.
+
+  The backward then needs only multiplies and adds -- ``d_up = dh * gate * s``,
+  ``d_gate = dh * up * s * (1 + gate * (1 - s))`` -- instead of recomputing the
+  sigmoid inside the fused down-projection dX epilogue.
+  """
+
+  @staticmethod
+  def forward(ctx, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    s = torch.sigmoid(gate.float())
+    ctx.save_for_backward(gate, up, s.to(gate.dtype))
+    return (gate.float() * s * up.float()).to(gate.dtype)
+
+  @staticmethod
+  def backward(ctx, dh: torch.Tensor):
+    gate, up, s = ctx.saved_tensors
+    g, u, sf, d = gate.float(), up.float(), s.float(), dh.float()
+    d_up = d * g * sf
+    d_gate = d * u * sf * (1.0 + g * (1.0 - sf))
+    return d_gate.to(gate.dtype), d_up.to(up.dtype)
+
+
+def _use_swiglu_saved_sigmoid(mlp: nn.Module) -> None:
+  """Routes an ``EsmcMLP``'s SiLU-gated product through `_SwiGLUSavedSigmoid`."""
+
+  def forward(x):
+    return mlp.down_proj(_SwiGLUSavedSigmoid.apply(mlp.gate_proj(x), mlp.up_proj(x)))
+
+  mlp.forward = forward
+
+
 def _materialize_output(module: nn.Module) -> None:
   """Wraps ``module.forward`` so its output passes `_MaterializeBarrier`."""
   from torchtitan.experiments.tpu.graph_trainer import tpu_backend_pass  # pylint: disable=g-import-not-at-top
@@ -1247,12 +1282,17 @@ def _use_tpu_esmc_attention(model: nn.Module) -> None:
   materialize = getattr(
       getattr(model, "config", None), "tpu_materialize_layernorms", False
   )
+  swiglu_saved_sigmoid = getattr(
+      getattr(model, "config", None), "tpu_swiglu_saved_sigmoid", False
+  )
   for module in model.modules():
     if type(module).__name__ == "EsmcAttention" and getattr(module, "head_dim", 0) % 2 == 0:
       _EsmcTPUAttention.install(module)
     if type(module).__name__ == "EsmcLayer" and materialize:
       _materialize_output(module.input_layernorm)
       _materialize_output(module.post_attention_layernorm)
+    if type(module).__name__ == "EsmcMLP" and swiglu_saved_sigmoid:
+      _use_swiglu_saved_sigmoid(module)
 
 
 def as_tpu_model_config(

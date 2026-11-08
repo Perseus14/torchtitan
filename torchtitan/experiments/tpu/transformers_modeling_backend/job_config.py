@@ -48,6 +48,10 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   # row: requires ``dataloader.pack_rows_to_context`` and
   # ``dataloader.max_documents_per_row <= ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW``.
   esmc_fold_segment_mask: bool = False
+  # ESM-C only: SwiGLU that saves sigmoid(gate) so the backward does not
+  # recompute it in the fused down-projection dX epilogue (+1 activation of
+  # (tokens, intermediate_size) per layer).
+  esmc_swiglu_saved_sigmoid: bool = False
 
   def __post_init__(self):
     super(TPUTransformersBackendConfig, self).__post_init__()
