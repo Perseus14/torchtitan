@@ -90,6 +90,10 @@ at 2.5473.
 | Barrier on LN2's forward output (alone / with LN1) | -0.6% / +0.1% |
 | P cast to bf16 before the forward P.V matmul | no change: Mosaic already does it |
 | Splash block re-sweep (8 other variants) | -0.3% to -2.6% |
+| Matmul autotuning (dots / fusions / layouts), `join_mxu_result_add` | neutral (same compiled numerics) |
+| libtpu 0.0.52 instead of 0.0.51 | +0.1% (noise) |
+| One fused QKV projection matmul | -1.4% |
+| Token-major splash output (head-pair output blocks) + lane-dense `di` | -0.6% (-2.6 GiB), bit-identical |
 | Collective / scheduler flags (SparseCore offload, LHS, async all-gather, ...) | within +-1% |
 | `dot_strength_reduction=false` | -10% |
 | Smaller splash blocks with document skipping | block overhead exceeds the savings |

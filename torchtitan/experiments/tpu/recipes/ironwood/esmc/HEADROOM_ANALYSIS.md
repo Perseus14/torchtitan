@@ -205,3 +205,15 @@ limits use P3 rates (996 TFLOP/s, 3.7 TB/s per TC).
 
 **Final:** 86.1k tok/s/TC, 33.4% MFU; 97.4k / 37.7% with p-state 7. 600-step
 loss 2.5483 vs 2.5488 baseline.
+
+## Round 5: remaining lossless ideas
+
+| Hypothesis | tok/s/TC (ref 86.1k) | Decision |
+|:--|--:|:--|
+| `xla_tpu_autotune_dots` / `_fusions` / dots+fusions+layouts | 86.1k / 86.0k / 86.1k | Neutral (identical loss: no effective program change) |
+| `xla_tpu_join_mxu_result_add` true / false | 86.1k / 86.1k | Neutral |
+| libtpu 0.0.52 (vs 0.0.51) | 86.2k | +0.1%, noise; not adopted |
+| One fused QKV projection (cat of permuted Wq/Wk and Wv) | 84.9k | -1.4%, reverted |
+| Token-major splash output: a head pair's (bq, 128) output block stays resident across its two head steps; `di` from token-major o / dO | 85.6k (-2.6 GiB) | -0.6%, reverted (bit-identical) |
+
+Final stays at 86.1k tok/s/TC, 33.4% MFU (97.4k / 37.7% with p-state 7).
