@@ -52,9 +52,22 @@ class TPUTransformersBackendConfig(TPUTrainerConfig):
   # recompute it in the fused down-projection dX epilogue (+1 activation of
   # (tokens, intermediate_size) per layer).
   esmc_swiglu_saved_sigmoid: bool = False
+  # ESM-C only: optimization barrier on each block's input LayerNorm output
+  # (forward only), so the QKV matmuls read it instead of recomputing the
+  # LayerNorm per tile; its gradient stays fused.
+  esmc_barrier_input_layernorm: bool = False
+  # ESM-C only (with esmc_fold_segment_mask): q/k in the split-halves lane
+  # order, so the fused prologue's rotate_half is one 64-lane roll per lane
+  # group. A per-step row gather of q_proj/k_proj/q_norm/k_norm weights.
+  esmc_qk_split_halves: bool = False
 
   def __post_init__(self):
     super(TPUTransformersBackendConfig, self).__post_init__()
+    if self.esmc_qk_split_halves and not self.esmc_fold_segment_mask:
+      raise ValueError(
+          "esmc_qk_split_halves requires esmc_fold_segment_mask (each head"
+          " keeps its own lanes only in the widened q/k)"
+      )
     if self.esmc_fold_segment_mask:
       if not self.esmc_fused_qk_norm_rope:
         raise ValueError(

@@ -404,8 +404,8 @@ def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
   """ESMC-600M ``hf_esmc_mlm_uniref50_graph`` with the MFU optimizations.
 
   Same model, data and hyperparameters, one microbatch of 16 x 2048 tokens per
-  rank. Measured on one tpu7x-8 host (8 TensorCores, torch_tpu 0.2.0): 85.3k
-  tok/s/TC, 33.1% MFU, vs 70.2k / 27.2% for ``hf_esmc_mlm_uniref50_graph``.
+  rank. Measured on one tpu7x-8 host (8 TensorCores, torch_tpu 0.2.0): 86.1k
+  tok/s/TC, 33.4% MFU, vs 70.2k / 27.2% for ``hf_esmc_mlm_uniref50_graph``.
   On top of the graph config:
 
   - ``sa_max_logit_const=0``: forward softmax with a fixed max (logits are
@@ -416,6 +416,9 @@ def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
   - ``optimizer_in_graph``: fwd + bwd + clip + AdamW as one program. One
     microbatch per optimizer step only (not the 4.19M-token 8x-accum recipe).
   - ``esmc_swiglu_saved_sigmoid``.
+  - ``esmc_barrier_input_layernorm``.
+  - ``esmc_qk_split_halves``: q/k in a lane order where ``rotate_half`` is one
+    64-lane roll (per-step row gather of the q/k projection weights).
   - ``esmc_fold_segment_mask``: the document mask rides in q/k's padding
     lanes. Caps rows at 63 documents (``max_documents_per_row``); rows holding
     more proteins (e.g. short-protein data) close early and pad.
@@ -444,6 +447,8 @@ def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
   cfg.tpu_config.optimizer_in_graph = True
   cfg.esmc_fold_segment_mask = True
   cfg.esmc_swiglu_saved_sigmoid = True
+  cfg.esmc_barrier_input_layernorm = True
+  cfg.esmc_qk_split_halves = True
   cfg.dataloader.max_documents_per_row = ESMC_FOLDED_MAX_DOCUMENTS_PER_ROW
   return cfg
 
@@ -545,4 +550,6 @@ def as_cpu_reference(config: TPUTransformersBackendConfig) -> TPUTransformersBac
   config.esmc_materialize_layernorms = False
   config.esmc_fold_segment_mask = False
   config.esmc_swiglu_saved_sigmoid = False
+  config.esmc_barrier_input_layernorm = False
+  config.esmc_qk_split_halves = False
   return config

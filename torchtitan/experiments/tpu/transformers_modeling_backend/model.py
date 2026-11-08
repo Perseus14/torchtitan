@@ -156,6 +156,12 @@ class TPUHFTransformerModel(HFTransformerModel):
       self._titan_injected_model_args["tpu_swiglu_saved_sigmoid"] = bool(
           getattr(config, "esmc_swiglu_saved_sigmoid", False)
       )
+      self._titan_injected_model_args["tpu_barrier_input_layernorm"] = bool(
+          getattr(config, "esmc_barrier_input_layernorm", False)
+      )
+      self._titan_injected_model_args["tpu_qk_split_halves"] = bool(
+          getattr(config, "esmc_qk_split_halves", False)
+      )
       HFTransformerModel.Config.update_from_config(self, config=config, **kwargs)
       self._complete_from_hf_config(hf_model_id)
 
@@ -1059,6 +1065,7 @@ class _EsmcTPUAttention(nn.Module):
       xv: torch.Tensor,
       position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
       segment_rel: torch.Tensor | None = None,
+      split_halves_perm: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float | None] | None:
     """`(q, k, v, scaling)` heads-first from the fused Pallas prologue, or None.
 
@@ -1099,20 +1106,36 @@ class _EsmcTPUAttention(nn.Module):
     q_scale = 1.0
     if scaling is not None and math.frexp(scaling)[0] == 0.5:
       q_scale, scaling = scaling, 1.0
+    wq, wk = self.q_norm.weight, self.k_norm.weight
+    if split_halves_perm is not None:
+      wq = wq.index_select(0, split_halves_perm)
+      wk = wk.index_select(0, split_halves_perm)
     query, key, value = qk_norm_rope.fused_qk_norm_rope(
         xq,
         xk,
         xv,
-        self.q_norm.weight,
-        self.k_norm.weight,
+        wq,
+        wk,
         cos.to(xq.dtype),
         sin.to(xq.dtype),
         heads=self.config.num_attention_heads,
         eps=self.q_norm.eps,
         q_scale=q_scale,
         segment_rel=segment_rel,
+        split_halves=split_halves_perm is not None,
     )
     return query, key, value, scaling
+
+  def _split_halves_perm(self, device: torch.device) -> torch.Tensor:
+    from torchtitan.experiments.tpu.kernels import qk_norm_rope  # pylint: disable=g-import-not-at-top
+
+    return torch.tensor(
+        qk_norm_rope.split_halves_permutation(
+            self.config.num_attention_heads, self.head_dim
+        ),
+        dtype=torch.long,
+        device=device,
+    )
 
   def _xla_prologue(
       self,
@@ -1156,15 +1179,32 @@ class _EsmcTPUAttention(nn.Module):
       )
 
     input_shape = hidden_states.shape[:-1]
-    xq = self.q_proj(hidden_states)
-    xk = self.k_proj(hidden_states)
+    segment_rel = _folded_segment_rel(self, kwargs)
+    split_halves = (
+        segment_rel is not None
+        and getattr(self.config, "tpu_qk_split_halves", False)
+        and hidden_states.device.type == "tpu"
+    )
+    if split_halves:
+      # q/k rows in the kernel's split-halves lane order (see
+      # `qk_norm_rope.split_halves_permutation`): a row gather of the weights
+      # per step; parameters and checkpoints keep the HF layout.
+      perm = self._split_halves_perm(hidden_states.device)
+      xq = _permuted_linear(self.q_proj, hidden_states, perm)
+      xk = _permuted_linear(self.k_proj, hidden_states, perm)
+    else:
+      perm = None
+      xq = self.q_proj(hidden_states)
+      xk = self.k_proj(hidden_states)
     xv = self.v_proj(hidden_states)
 
     scaling = self.scaling
-    segment_rel = _folded_segment_rel(self, kwargs)
     fused = self._fused_prologue(
-        xq, xk, xv, position_embeddings, segment_rel=segment_rel
+        xq, xk, xv, position_embeddings, segment_rel=segment_rel,
+        split_halves_perm=perm,
     )
+    if fused is None and split_halves:
+      raise ValueError("esmc_qk_split_halves needs the fused qk_norm_rope path")
     if fused is not None:
       query, key, value, scaling = fused
       if segment_rel is not None:
@@ -1186,6 +1226,14 @@ class _EsmcTPUAttention(nn.Module):
         **kwargs,
     )
     return self.o_proj(attn_output.reshape(*input_shape, -1)), attn_weights
+
+
+def _permuted_linear(
+    proj: nn.Linear, x: torch.Tensor, perm: torch.Tensor
+) -> torch.Tensor:
+  """``proj(x)`` with output features reordered by ``perm``."""
+  bias = None if proj.bias is None else proj.bias.index_select(0, perm)
+  return nn.functional.linear(x, proj.weight.index_select(0, perm), bias)
 
 
 def _folded_segment_rel(attn: nn.Module, kwargs) -> torch.Tensor | None:
@@ -1264,6 +1312,35 @@ def _use_swiglu_saved_sigmoid(mlp: nn.Module) -> None:
   mlp.forward = forward
 
 
+class _FwdBarrier(torch.autograd.Function):
+  """XLA optimization barrier on the value; identity on the gradient.
+
+  The producer is materialized once instead of being recomputed as the
+  prologue of every matmul tile that reads it; the gradient stays fusible.
+  """
+
+  @staticmethod
+  def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+    return torch.tpu.ops.optimization_barrier([x])[0]
+
+  @staticmethod
+  def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+    return grad
+
+
+def _barrier_forward_output(module: nn.Module) -> None:
+  """Wraps ``module.forward`` so its output passes `_FwdBarrier`."""
+  from torchtitan.experiments.tpu.graph_trainer import tpu_backend_pass  # pylint: disable=g-import-not-at-top
+  tpu_backend_pass._ensure_optimization_barrier_fake()  # pylint: disable=protected-access
+  inner = module.forward
+
+  def forward(*args, **kwargs):
+    out = inner(*args, **kwargs)
+    return _FwdBarrier.apply(out) if out.device.type == "tpu" else out
+
+  module.forward = forward
+
+
 def _materialize_output(module: nn.Module) -> None:
   """Wraps ``module.forward`` so its output passes `_MaterializeBarrier`."""
   from torchtitan.experiments.tpu.graph_trainer import tpu_backend_pass  # pylint: disable=g-import-not-at-top
@@ -1285,6 +1362,17 @@ def _use_tpu_esmc_attention(model: nn.Module) -> None:
   swiglu_saved_sigmoid = getattr(
       getattr(model, "config", None), "tpu_swiglu_saved_sigmoid", False
   )
+  barrier_ln1 = getattr(
+      getattr(model, "config", None), "tpu_barrier_input_layernorm", False
+  )
+  if barrier_ln1 and materialize:
+    raise ValueError(
+        "esmc_barrier_input_layernorm and esmc_materialize_layernorms are"
+        " exclusive"
+    )
+  for module in model.modules():
+    if type(module).__name__ == "EsmcLayer" and barrier_ln1:
+      _barrier_forward_output(module.input_layernorm)
   for module in model.modules():
     if type(module).__name__ == "EsmcAttention" and getattr(module, "head_dim", 0) % 2 == 0:
       _EsmcTPUAttention.install(module)

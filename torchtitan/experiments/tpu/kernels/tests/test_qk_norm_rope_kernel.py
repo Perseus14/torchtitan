@@ -321,6 +321,74 @@ class QkNormRopeKernelTest(parameterized.TestCase):
     for got, want in zip(widened, plain):
       np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
+  def test_split_halves_matches_folded_layout(self):
+    """Split-halves q/k (permuted inputs) give the folded layout's scores and
+    input gradients after un-permuting."""
+    from torchtitan.experiments.tpu.kernels import qk_norm_rope  # pylint: disable=g-import-not-at-top
+
+    batch, seq, heads, head_dim, block_s = 2, 32, 4, 64, 16
+    hidden_dim = heads * head_dim
+    keys = jax.random.split(jax.random.PRNGKey(1), 8)
+    xq, xk, xv = (
+        jax.random.normal(keys[i], (batch, seq, hidden_dim)).astype(jnp.bfloat16)
+        for i in range(3)
+    )
+    wq = (1.0 + 0.1 * jax.random.normal(keys[3], (hidden_dim,))).astype(jnp.bfloat16)
+    wk = (1.0 + 0.1 * jax.random.normal(keys[4], (hidden_dim,))).astype(jnp.bfloat16)
+    angles = jax.random.uniform(keys[5], (1, seq, head_dim // 2), minval=-3.0, maxval=3.0)
+    emb = jnp.concatenate([angles, angles], axis=-1)
+    cos, sin = jnp.cos(emb).astype(jnp.bfloat16), jnp.sin(emb).astype(jnp.bfloat16)
+    rel = jnp.array(
+        [[0] * 10 + [1] * 12 + [2] * 10, [0] * 20 + [1] * 12], jnp.int32
+    )[..., None]
+    perm = jnp.asarray(qk_norm_rope.split_halves_permutation(heads, head_dim))
+    common = dict(heads=heads, eps=1e-5, q_scale=0.125, block_s=block_s,
+                  segment_rel=rel, interpret=True)
+
+    qa, ka, va = kernel.qk_norm_rope_fwd(xq, xk, xv, wq, wk, cos, sin, **common)
+    qs, ks, vs = kernel.qk_norm_rope_fwd(
+        xq[..., perm], xk[..., perm], xv, wq[perm], wk[perm], cos, sin,
+        split_halves=True, **common,
+    )
+    np.testing.assert_array_equal(np.asarray(vs), np.asarray(va))
+    scores = lambda q, k: jnp.einsum(
+        "bhsd,bhtd->bhst", q.astype(jnp.float32), k.astype(jnp.float32))
+    np.testing.assert_allclose(
+        np.asarray(scores(qs, ks)), np.asarray(scores(qa, ka)), atol=0.05
+    )
+
+    # Backward: the same per-head gradient, placed in each layout's lanes.
+    gq = jax.random.normal(keys[6], (batch, heads, seq, head_dim)).astype(jnp.bfloat16)
+    gk = jax.random.normal(keys[7], (batch, heads, seq, head_dim)).astype(jnp.bfloat16)
+    lane = np.arange(128)
+    dim = lane % 32 + 32 * (lane >= 64)
+
+    def folded(g):  # even heads lanes [0, 64), odd heads [64, 128)
+      pad = jnp.zeros_like(g)
+      t = jnp.concatenate([g, pad], -1)
+      return t.at[:, 1::2].set(jnp.roll(t[:, 1::2], head_dim, axis=-1))
+
+    def split(g):  # head h's values on its own split-halves lanes
+      even = (lane % 64) < 32
+      out = []
+      for h in range(heads):
+        own = even if h % 2 == 0 else ~even
+        out.append(jnp.where(own, g[:, h][..., dim], 0.0))
+      return jnp.stack(out, 1).astype(g.dtype)
+
+    bwd = dict(eps=1e-5, q_scale=0.125, block_s=block_s, interpret=True)
+    ref = kernel.qk_norm_rope_bwd(
+        xq, xk, wq, wk, cos, sin, folded(gq), folded(gk), va, **bwd)
+    got = kernel.qk_norm_rope_bwd(
+        xq[..., perm], xk[..., perm], wq[perm], wk[perm], cos, sin,
+        split(gq), split(gk), vs, split_halves=True, **bwd)
+    inv = jnp.argsort(perm)
+    unperm = (got[0][..., inv], got[1][..., inv], got[2], got[3][inv], got[4][inv])
+    for name, g, r in zip(("dxq", "dxk", "dxv", "dwq", "dwk"), unperm, ref):
+      np.testing.assert_allclose(
+          np.asarray(g, np.float32), np.asarray(r, np.float32),
+          rtol=2e-2, atol=2e-2, err_msg=name)
+
 
 if __name__ == "__main__":
   absltest.main()

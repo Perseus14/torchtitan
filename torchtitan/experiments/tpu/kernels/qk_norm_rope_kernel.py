@@ -147,6 +147,18 @@ def _rotate_half_partner(
   return jnp.where(first_half_mask, ahead, behind)
 
 
+def _split_halves_tables(
+    cos: jax.Array, sin: jax.Array, half_dim: int
+) -> tuple[jax.Array, jax.Array]:
+  """`(bs, D)` RoPE tables -> `(bs, 128)` in the split-halves lane order."""
+
+  def tile(t):
+    lo, hi = t[:, :half_dim], t[:, half_dim:]
+    return jnp.concatenate([lo, lo, hi, hi], axis=-1)
+
+  return tile(cos), tile(sin)
+
+
 def _lane_group_row_sum(x: jax.Array, group_width: int) -> jax.Array:
   """`(rows, 1)` sum over the last axis: elementwise adds across lane groups,
   then one cross-lane reduce (instead of one XLU reduce per lane group)."""
@@ -179,7 +191,9 @@ def _pack_heads_to_group(
   return parts[0] if heads_per_group == 1 else jnp.concatenate(parts, axis=-1)
 
 
-def _segment_lanes_tiles(seg_ref, bs: int, head_dim: int, big: float):
+def _segment_lanes_tiles(
+    seg_ref, bs: int, head_dim: int, big: float, *, split_halves: bool = False
+):
   """`(q_extra, k_extra)` `(bs, 128)` f32 tiles for the folded segment mask.
 
   The `128 - head_dim` lanes that do not hold a head's values carry
@@ -193,7 +207,12 @@ def _segment_lanes_tiles(seg_ref, bs: int, head_dim: int, big: float):
   # Even heads keep their values in lanes [0, D) and the code in [D, 128); odd
   # heads the other way round, so no head is lane-shifted (q . k sums over all
   # 128 lanes, so where the values sit does not matter to the attention).
-  hit = jax.lax.rem(lane, head_dim) == rel
+  if split_halves:
+    # A head's 64 code lanes are the other head's lanes of the group.
+    half = head_dim // 2
+    hit = (jax.lax.rem(lane, half) + jnp.where(lane >= head_dim, half, 0)) == rel
+  else:
+    hit = jax.lax.rem(lane, head_dim) == rel
   q_extra = jnp.where(hit, 1.0, 0.0).astype(jnp.float32)
   k_extra = jnp.where(hit, 0.0, -big).astype(jnp.float32)
   return lane, q_extra, k_extra
@@ -213,6 +232,7 @@ def _qk_norm_rope_fwd_kernel(
     eps: float,
     q_scale: float,
     seg_big: float | None = None,
+    split_halves: bool = False,
 ):
   if seg_big is not None:
     seg_ref, oq_ref, ok_ref, ov_ref = refs
@@ -223,18 +243,33 @@ def _qk_norm_rope_fwd_kernel(
   heads_per_group = group_width // head_dim
   half_dim = head_dim // 2
   n_groups = (heads * head_dim) // group_width
-  first_half = _first_half_head_mask(bs, group_width, head_dim)
-  cos = _repeat_for_group_heads(
-      cos_ref[0].astype(jnp.float32), group_width, head_dim
-  )
-  sin = _repeat_for_group_heads(
-      sin_ref[0].astype(jnp.float32), group_width, head_dim
-  )
+  if split_halves:
+    lane_s = jax.lax.broadcasted_iota(jnp.int32, (bs, group_width), 1)
+    first_half = lane_s < head_dim
+    head0_lanes = jax.lax.rem(lane_s, head_dim) < half_dim
+    cos, sin = _split_halves_tables(
+        cos_ref[0].astype(jnp.float32), sin_ref[0].astype(jnp.float32), half_dim
+    )
+  else:
+    first_half = _first_half_head_mask(bs, group_width, head_dim)
+    cos = _repeat_for_group_heads(
+        cos_ref[0].astype(jnp.float32), group_width, head_dim
+    )
+    sin = _repeat_for_group_heads(
+        sin_ref[0].astype(jnp.float32), group_width, head_dim
+    )
   sin_signed = jnp.where(first_half, -sin, sin)
+
+  def partner(t):
+    if split_halves:
+      return pltpu.roll(t, head_dim, 1)
+    return _rotate_half_partner(t, first_half, half_dim)
 
   if seg_big is not None:
     assert head_dim * 2 == NUM_LANES and heads_per_group == 2
-    lane, q_extra, k_extra = _segment_lanes_tiles(seg_ref, bs, head_dim, seg_big)
+    lane, q_extra, k_extra = _segment_lanes_tiles(
+        seg_ref, bs, head_dim, seg_big, split_halves=split_halves
+    )
   for x_ref, w_ref, o_ref, scale, extra in (
       (xq_ref, wq_ref, oq_ref, q_scale, None if seg_big is None else q_extra),
       (xk_ref, wk_ref, ok_ref, 1.0, None if seg_big is None else k_extra),
@@ -249,15 +284,16 @@ def _qk_norm_rope_fwd_kernel(
       )
       out = (
           normed * cos
-          + _rotate_half_partner(normed, first_half, half_dim) * sin_signed
+          + partner(normed) * sin_signed
       )
       if scale != 1.0:
         out = out * scale
       out = out.astype(o_ref.dtype)
       if extra is not None:
-        # Head 0 of the group sits in lanes [0, 64) and head 1 in [64, 128);
-        # each keeps its lanes and the other half carries the segment code.
-        low = lane < head_dim
+        # Head 0 of the group sits in lanes [0, 64) (split halves: lanes
+        # [0, 32) and [64, 96)) and head 1 in the rest; each keeps its lanes
+        # and the other head's lanes carry the segment code.
+        low = head0_lanes if split_halves else lane < head_dim
         o_ref[0, gi * 2] = jnp.where(
             low, out.astype(jnp.float32), extra).astype(o_ref.dtype)
         o_ref[0, gi * 2 + 1] = jnp.where(
@@ -297,6 +333,7 @@ def _qk_norm_rope_bwd_kernel(
     head_dim: int,
     eps: float,
     q_scale: float,
+    split_halves: bool = False,
 ):
   s_idx = pl.program_id(1)
   bs = xq_ref.shape[1]
@@ -305,14 +342,27 @@ def _qk_norm_rope_bwd_kernel(
   heads_per_group = group_width // head_dim
   half_dim = head_dim // 2
   n_groups = hidden_dim // group_width
-  first_half = _first_half_head_mask(bs, group_width, head_dim)
-  cos = _repeat_for_group_heads(
-      cos_ref[0].astype(jnp.float32), group_width, head_dim
-  )
-  sin = _repeat_for_group_heads(
-      sin_ref[0].astype(jnp.float32), group_width, head_dim
-  )
+  if split_halves:
+    lane_s = jax.lax.broadcasted_iota(jnp.int32, (bs, group_width), 1)
+    first_half = lane_s < head_dim
+    head0_lanes = jax.lax.rem(lane_s, head_dim) < half_dim
+    cos, sin = _split_halves_tables(
+        cos_ref[0].astype(jnp.float32), sin_ref[0].astype(jnp.float32), half_dim
+    )
+  else:
+    first_half = _first_half_head_mask(bs, group_width, head_dim)
+    cos = _repeat_for_group_heads(
+        cos_ref[0].astype(jnp.float32), group_width, head_dim
+    )
+    sin = _repeat_for_group_heads(
+        sin_ref[0].astype(jnp.float32), group_width, head_dim
+    )
   sin_signed = jnp.where(first_half, -sin, sin)
+
+  def partner(t):
+    if split_halves:
+      return pltpu.roll(t, head_dim, 1)
+    return _rotate_half_partner(t, first_half, half_dim)
 
   # Grid axis 1 is marked "arbitrary" so sequence tiles execute in order within
   # each batch index `b`, initializing `dwq`/`dwk` on tile 0 and accumulating.
@@ -337,7 +387,9 @@ def _qk_norm_rope_bwd_kernel(
         lane_g = jax.lax.broadcasted_iota(jnp.int32, (bs, NUM_LANES), 1)
         g0 = g_ref[0, gi * 2].astype(jnp.float32)
         g1 = g_ref[0, gi * 2 + 1].astype(jnp.float32)
-        grad_out = jnp.where(lane_g < head_dim, g0, g1)
+        grad_out = jnp.where(
+            head0_lanes if split_halves else lane_g < head_dim, g0, g1
+        )
       else:
         grad_out = _pack_heads_to_group(g_ref, gi, heads_per_group, to_f32=True)
       if scale != 1.0:
@@ -345,9 +397,7 @@ def _qk_norm_rope_bwd_kernel(
       # Exact VJP of `n * cos + rotate_partner(n) * sin_signed` for any (cos, sin):
       # k < half receives +grad_out[k + half] * sin[k + half];
       # k >= half receives -grad_out[k - half] * sin[k - half].
-      dnormed = grad_out * cos + _rotate_half_partner(
-          grad_out * sin_signed, first_half, half_dim
-      )
+      dnormed = grad_out * cos + partner(grad_out * sin_signed)
       xhat = (x[:, sl] - mu) * rstd
       dw_ref[0, :, sl] += jnp.sum(dnormed * xhat, axis=0, keepdims=True)
       dxhat = dnormed * w_ref[:, sl].astype(jnp.float32)
@@ -448,6 +498,7 @@ def qk_norm_rope_fwd(
     interpret: bool = False,
     segment_rel: jax.Array | None = None,
     seg_big: float = 2.0**14,
+    split_halves: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
   """Fused forward: `(B, S, H*D)` projections -> heads-first `(B, H, S, D)`.
 
@@ -482,6 +533,8 @@ def qk_norm_rope_fwd(
       hidden_dim, heads, head_dim, bs, cos_batched=cos.shape[0] > 1
   )
   widened = segment_rel is not None
+  if split_halves and not widened:
+    raise ValueError("split_halves needs segment_rel (widened q/k)")
   kernel = functools.partial(
       _qk_norm_rope_fwd_kernel,
       heads=heads,
@@ -489,6 +542,7 @@ def qk_norm_rope_fwd(
       eps=eps,
       q_scale=q_scale,
       seg_big=seg_big if widened else None,
+      split_halves=split_halves,
   )
   qk_dim = NUM_LANES if widened else head_dim
   out_shape = (
@@ -537,6 +591,7 @@ def qk_norm_rope_bwd(
     block_s: int = DEFAULT_BLOCK_S,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     interpret: bool = False,
+    split_halves: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
   """Fused backward returning `(dxq, dxk, dxv)` in `(B, S, H*D)` and `(dwq, dwk)`."""
   if gq.ndim != 4 or gk.shape != gq.shape or gv.shape[:3] != gq.shape[:3]:
@@ -560,12 +615,15 @@ def qk_norm_rope_bwd(
       hidden_dim, heads, head_dim, bs, cos_batched=cos.shape[0] > 1
   )
   dw_spec = pl.BlockSpec((1, 1, hidden_dim), lambda b, s: (b, 0, 0))
+  if split_halves and qk_dim != NUM_LANES:
+    raise ValueError("split_halves needs widened (128-lane) gq/gk")
   kernel = functools.partial(
       _qk_norm_rope_bwd_kernel,
       heads=heads,
       head_dim=head_dim,
       eps=eps,
       q_scale=q_scale,
+      split_halves=split_halves,
   )
   out_shape = (
       jax.ShapeDtypeStruct((batch, seq, hidden_dim), xq.dtype),

@@ -91,6 +91,29 @@ def supported(
   return None
 
 
+def split_halves_permutation(heads: int, head_dim: int) -> list[int]:
+  """`perm[lane] = hf_index` for the split-halves q/k lane layout (head_dim 64).
+
+  Each 128-lane group holds two heads as `[h0[:32] | h1[:32] | h0[32:] |
+  h1[32:]]`: every lane's `rotate_half` partner is 64 lanes away (one roll), and
+  each head keeps its own lanes in the widened (segment-lanes) output. Applied
+  to the q/k projection rows and norm weights; `q . k` is unchanged because q
+  and k share the permutation.
+  """
+  if head_dim * 2 != NUM_LANES or heads % 2:
+    raise ValueError(
+        f"split-halves layout needs head_dim 64 and an even head count, got"
+        f" head_dim={head_dim}, heads={heads}"
+    )
+  perm = []
+  for group in range(heads // 2):
+    for lane in range(NUM_LANES):
+      head = 2 * group + (1 if lane % head_dim >= head_dim // 2 else 0)
+      dim = lane % (head_dim // 2) + (head_dim // 2 if lane >= head_dim else 0)
+      perm.append(head * head_dim + dim)
+  return perm
+
+
 @functools.cache
 def _get_pallas_ops():
   """Lazily imports `torch_tpu` + JAX Pallas kernels and registers autograd."""
@@ -138,6 +161,7 @@ def _get_pallas_ops():
       eps: float,
       q_scale: float,
       block_s: int,
+      split_halves: bool,
   ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     return kernel.qk_norm_rope_bwd(
         xq,
@@ -152,6 +176,7 @@ def _get_pallas_ops():
         eps=eps,
         q_scale=q_scale,
         block_s=block_s,
+        split_halves=split_halves,
     )
 
   fwd_op = pallas.jax_op("pallas::qk_norm_rope_fwd", _fwd_jax)
@@ -164,6 +189,7 @@ def _get_pallas_ops():
     ctx.eps = eps
     ctx.q_scale = q_scale
     ctx.block_s = block_s
+    ctx.split_halves = False
 
   def _backward(ctx, gq, gk, gv):
     xq, xk, wq, wk, cos, sin = ctx.saved_tensors
@@ -180,6 +206,7 @@ def _get_pallas_ops():
         ctx.eps,
         ctx.q_scale,
         ctx.block_s,
+        ctx.split_halves,
     )
     return dxq, dxk, dxv, dwq, dwk, None, None, None, None, None, None
 
@@ -198,26 +225,29 @@ def _get_pallas_ops():
       eps: float,
       q_scale: float,
       block_s: int,
+      split_halves: bool,
   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     return kernel.qk_norm_rope_fwd(
         xq, xk, xv, wq, wk, cos, sin, heads=heads, eps=eps, q_scale=q_scale,
-        block_s=block_s, segment_rel=segment_rel,
+        block_s=block_s, segment_rel=segment_rel, split_halves=split_halves,
     )
 
   fwd_seg_op = pallas.jax_op("pallas::qk_norm_rope_seg_fwd", _fwd_seg_jax)
 
   def _setup_context_seg(ctx, inputs, output):
     del output
-    xq, xk, _, wq, wk, cos, sin, _, _, eps, q_scale, block_s = inputs
+    xq, xk, _, wq, wk, cos, sin, _, _, eps, q_scale, block_s, split = inputs
     ctx.save_for_backward(xq, xk, wq, wk, cos, sin)
     ctx.eps = eps
     ctx.q_scale = q_scale
     ctx.block_s = block_s
+    ctx.split_halves = split
 
   def _backward_seg(ctx, gq, gk, gv):
     grads = _backward(ctx, gq, gk, gv)
-    # Insert the (non-differentiable) segment_rel slot after sin.
-    return grads[:7] + (None,) + grads[7:]
+    # Insert the (non-differentiable) segment_rel slot after sin and the
+    # split_halves slot at the end.
+    return grads[:7] + (None,) + grads[7:] + (None,)
 
   fwd_seg_op.register_autograd(_backward_seg, setup_context=_setup_context_seg)
   return fwd_op, bwd_op, fwd_seg_op
@@ -237,6 +267,7 @@ def fused_qk_norm_rope(
     q_scale: float = 1.0,
     block_s: int = DEFAULT_BLOCK_S,
     segment_rel: torch.Tensor | None = None,
+    split_halves: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   """Runs the fused QK-LayerNorm + `rotate_half` RoPE + heads-first prologue.
 
@@ -254,6 +285,8 @@ def fused_qk_norm_rope(
     q_scale: Multiplier folded into `q` (exact in bf16 for powers of two such as
       `64 ** -0.5 = 0.125`, allowing the attention kernel to run with scale 1).
     block_s: Sequence tile size per Pallas grid step.
+    split_halves: `xq`/`xk`/`wq`/`wk` are in `split_halves_permutation` lane
+      order (needs `segment_rel`); the widened q/k come back in that order.
 
   Returns:
     Heads-first `(B, H, S, D)` `(q, k, v)` tensors.
@@ -281,6 +314,8 @@ def fused_qk_norm_rope(
   bs = pick_seq_block(xq.shape[1], block_s)
   assert bs is not None
   fwd_op, _, fwd_seg_op = _get_pallas_ops()
+  if split_halves and segment_rel is None:
+    raise ValueError("split_halves needs segment_rel")
   if segment_rel is not None:
     return fwd_seg_op(
         xq.contiguous(),
@@ -295,6 +330,7 @@ def fused_qk_norm_rope(
         float(eps),
         float(q_scale),
         int(bs),
+        bool(split_halves),
     )
   return fwd_op(
       xq.contiguous(),
