@@ -404,12 +404,13 @@ def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
   """ESMC-600M ``hf_esmc_mlm_uniref50_graph`` with the MFU optimizations.
 
   Same model, data and hyperparameters, one microbatch of 16 x 2048 tokens per
-  rank. Measured on one tpu7x-8 host (8 TensorCores, torch_tpu 0.2.0): 85.0k
-  tok/s/TC, 32.9% MFU, vs 70.2k / 27.2% for ``hf_esmc_mlm_uniref50_graph``.
+  rank. Measured on one tpu7x-8 host (8 TensorCores, torch_tpu 0.2.0): 85.3k
+  tok/s/TC, 33.1% MFU, vs 70.2k / 27.2% for ``hf_esmc_mlm_uniref50_graph``.
   On top of the graph config:
 
   - ``sa_max_logit_const=0``: forward softmax with a fixed max (logits are
     bounded by QK-LayerNorm).
+  - ``sa_block_kv_compute=2048`` (forward kv compute sub-block).
   - ``xla_tpu_scoped_vmem_limit_kib=65536``.
   - ``xla_tpu_reduce_window_reduction_dim_max=0`` (LayerNorm backward).
   - ``optimizer_in_graph``: fwd + bwd + clip + AdamW as one program. One
@@ -426,6 +427,10 @@ def hf_esmc600m_mlm_uniref50_graph_opt() -> TPUTransformersBackendConfig:
   cfg.hf_model = "biohub/ESMC-600M"
   cfg.training.num_tokens_per_microbatch_per_dp_rank = 16 * 2048
   cfg.splash_attention_kernel.sa_max_logit_const = 0.0
+  # With the folded segment mask the forward runs without segment ids; one
+  # 2048-wide kv compute sub-block then beats 512 (+0.4%). Only the fp32
+  # accumulation order changes.
+  cfg.splash_attention_kernel.sa_block_kv_compute = 2048
   cfg.libtpu_init_flags = tpu_flags.merge_flags(
       cfg.libtpu_init_flags,
       xla_tpu_scoped_vmem_limit_kib=65536,
