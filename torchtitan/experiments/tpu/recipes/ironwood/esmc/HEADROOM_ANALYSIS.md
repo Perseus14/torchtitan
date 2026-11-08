@@ -176,3 +176,32 @@ The remaining gap is now dominated by attention at the head_dim-64 cap (175 ms o
 | dkv `block_q_dkv` 1024 / `block_kv_dkv` 1024 | 83.5k / 82.8k | -1.7% / -2.6% |
 
 **Final:** 85.3k tok/s/TC, 33.1% MFU; with p-state 7, 97.0k / 37.6%.
+
+## Round 4: speed-of-light check of the final configuration
+
+Profile of the 85.3k configuration (381.7 ms per step on the device);
+limits use P3 rates (996 TFLOP/s, 3.7 TB/s per TC).
+
+| Component | Measured (ms) | Limit (ms) | % | Bound (LLO / profile) |
+|:--|--:|--:|--:|:--|
+| Splash dkv | 120.4 | 44.7 at full MXU | -- | MXU: critical path >99% bf16 MXU, a third masked K=64 contractions |
+| Splash fwd | 54.0 | 16.8 at full MXU | -- | MXU: critical path >99% MXU (P already fed as bf16) |
+| Matmul dW | 49.0 | 37.6 (41.8 at the ~90% tile ceiling) | 77% | compute |
+| Matmul dX (+ fused LN-bwd and SwiGLU-bwd epilogues) | 57.4 | 37.6 | 65% | one LN-bwd fusion is HBM-bound (17 ms), but splitting it is slower |
+| Matmul fwd (+ fused LN prologue, SwiGLU epilogue) | 53.4 | 37.6 | 70% | QKV at 62% (LN1 recompute) |
+| `qk_norm_rope` fwd / bwd | 9.9 / 14.1 | 6.6 / 8.1 (HBM) | 67% / 57% | lane rotates (86% of the critical path) |
+| Residual adds, `di`, LN stats, relayout copies | ~20 | ~8 (HBM) | ~40% | HBM, partly non-native layouts |
+| Optimizer, exposed collectives, loss | ~3.5 | ~0.6 | -- | negligible |
+
+| Hypothesis | Result | Decision |
+|:--|--:|:--|
+| A: barrier on LayerNorm gradients (both / LN1 / LN2) | -1.3% / -0.7% / -1.1% | Dropped |
+| B: forward barrier on LN1 (repeated) | +0.2% (+2.5 GiB) | **Adopted** (`esmc_barrier_input_layernorm`) |
+| B': forward barrier on LN2 / both | -0.6% / +0.1% | Dropped |
+| C: row sum via a ones lane in V | -- | Not built: the forward is MXU-bound, this adds MXU work |
+| bf16 P for the forward P.V | identical output and time | Dropped (Mosaic already rounds P) |
+| D: dkv vector-op audit | -- | Not pursued: dkv is MXU-bound, not VALU-bound |
+| F: split-halves q/k lanes (one roll for `rotate_half`) | +0.45% | **Adopted** (`esmc_qk_split_halves`) |
+
+**Final:** 86.1k tok/s/TC, 33.4% MFU; 97.4k / 37.7% with p-state 7. 600-step
+loss 2.5483 vs 2.5488 baseline.

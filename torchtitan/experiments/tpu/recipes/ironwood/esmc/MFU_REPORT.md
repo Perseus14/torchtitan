@@ -10,12 +10,12 @@ are in [README.md](README.md); the per-component profile analysis is in
 | Config | tok/s/TC | MFU |
 |---|---:|---:|
 | `hf_esmc_mlm_uniref50_graph` (baseline) | 70.2k | 27.2% |
-| `hf_esmc600m_mlm_uniref50_graph_opt` | **85.3k** | **33.1%** |
-| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` | **97.0k** | **37.6%** |
+| `hf_esmc600m_mlm_uniref50_graph_opt` | **86.1k** | **33.4%** |
+| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` | **97.4k** | **37.7%** |
 
 MFU divides by 1,153.5 TFLOP/s/TC, the P7 (2.2 GHz) peak. Without the p-state
 flag the chip runs at the nominal P3 clock (1.9 GHz, ~996 TFLOP/s/TC), so
-33.1% nominal is ~38% of the peak at the clock actually in use. The p-state 7
+33.4% nominal is ~38.7% of the peak at the clock actually in use. The p-state 7
 row's gain is clock, not kernel efficiency.
 
 ## Numerics
@@ -35,10 +35,9 @@ vs the optimized stack:
 | 500 | 2.56487 | 2.56509 | 0.308 | 0.296 |
 | 600 | **2.54881** | **2.54839** | 0.285 | 0.303 |
 
-The table is the 30.3% stack. The 32.8% stack ends at **2.5473** at step 600.
-The `qk_norm_rope` no-roll layout is bit-identical (same loss at every
-logged step). The forward kv compute sub-block (33.1%) gives 2.6356 vs 2.6280
-at step 100 (fp32 accumulation order only).
+The table is the 30.3% stack. The final 33.4% stack ends at **2.5483** at
+step 600 (steps 100 / 300 / 600: 2.6339 / 2.5698 / 2.5483), the 32.8% stack
+at 2.5473.
 
 ## What moved MFU, and why
 
@@ -65,6 +64,13 @@ at step 100 (fp32 accumulation order only).
   (XLU) reductions and rotates. Lane groups are now added elementwise and
   reduced across lanes once per row tile; the smaller live set lets `block_s`
   grow to 1024 (+2.6% together with the no-roll layout).
+- **Split-halves q/k lanes:** with each 128-lane group holding
+  `[h0[:32] | h1[:32] | h0[32:] | h1[32:]]`, `rotate_half` is one 64-lane
+  roll (was two plus a select). The q/k projection and norm weights are
+  row-gathered per step. Microbench: fwd 0.443 -> 0.404 ms, bwd 0.573 ->
+  0.484 ms per layer (+0.45% end to end).
+- **Input-LayerNorm barrier:** forward-only barrier on LN1 so the QKV matmuls
+  stop recomputing it per tile (+0.2%, +2.5 GiB).
 - **Splash block re-sweep:** 2048 x 2048 blocks and dkv compute 1024 remain
   best; with no segment ids the forward kv compute sub-block moves 512 -> 2048
   (+0.4%).
@@ -80,6 +86,10 @@ at step 100 (fp32 accumulation order only).
 | SwiGLU saving `silu(gate)` instead of `gate` | -2.1% |
 | SwiGLU fusion-split optimization barriers (fwd / bwd / both) | -1.2% / -1.4% / -2.5% |
 | `qk_norm_rope` rotate-half on the MXU (0/1 permutation matmul) | ~neutral in microbench; VMEM OOM at block_s 1024 |
+| Barriers on the LayerNorm gradients (unfuse LN bwd from the dX matmul) | -0.7% to -1.3% |
+| Barrier on LN2's forward output (alone / with LN1) | -0.6% / +0.1% |
+| P cast to bf16 before the forward P.V matmul | no change: Mosaic already does it |
+| Splash block re-sweep (8 other variants) | -0.3% to -2.6% |
 | Collective / scheduler flags (SparseCore offload, LHS, async all-gather, ...) | within +-1% |
 | `dot_strength_reduction=false` | -10% |
 | Smaller splash blocks with document skipping | block overhead exceeds the savings |
@@ -87,9 +97,12 @@ at step 100 (fp32 accumulation order only).
 
 ## Remaining headroom
 
-About 45% of the step is attention, close to the head_dim-64 cap (a 64-wide
-contraction on the 256 x 256 MXU), and about 39% is matmuls at 70-89% of peak
-against a ~90% ceiling (d = 1152 = 4.5 x 256). Beyond ~38% MFU at p-state 7
+About 45% of the step is attention. LLO shows both splash kernels with a
+critical path that is >99% MXU (bf16, with masked K=64 contractions in dkv):
+they are bound by the MXU shape head_dim 64 implies, not by vector work. About
+42% is matmuls at 65-88% of peak against a ~90% ceiling (d = 1152 = 4.5 x 256),
+with LayerNorm / SwiGLU epilogues fused in (splitting them was measured slower).
+See HEADROOM_ANALYSIS.md for the per-component table. Beyond ~38% MFU at p-state 7
 needs FP8 matmuls or an architecture change (e.g. head_dim 128).
 
 ## Caveats

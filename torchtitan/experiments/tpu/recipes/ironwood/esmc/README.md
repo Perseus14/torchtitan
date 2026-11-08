@@ -126,9 +126,9 @@ optimizations:
 
 `--config=hf_esmc600m_mlm_uniref50_graph_opt` (same model, data and
 hyperparameters; one microbatch of 16 x 2048 tokens per rank) reaches
-**85.3k tok/s/TC, 33.1% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
+**86.1k tok/s/TC, 33.4% MFU** on one tpu7x-8 host (torch_tpu 0.2.0), vs 70.2k /
 27.2% for `hf_esmc_mlm_uniref50_graph` on the same host; 600-step UniRef50
-loss 2.5473 vs 2.5488 (seed 42), with matching grad-norm curves. Details,
+loss 2.5483 vs 2.5488 (seed 42), with matching grad-norm curves. Details,
 numerics and dropped experiments: [MFU_REPORT.md](MFU_REPORT.md); profile
 headroom per component: [HEADROOM_ANALYSIS.md](HEADROOM_ANALYSIS.md).
 Cumulative, 100-step runs:
@@ -147,8 +147,10 @@ Cumulative, 100-step runs:
 | - `esmc_materialize_layernorms` (no longer pays off) | 82.9k | 32.1% |
 | + fused QK prologue: one cross-lane reduce per row tile, `block_s` 1024 | 84.6k | 32.8% |
 | + folded mask: odd heads keep their upper lanes (no lane roll) | 85.0k | 32.9% |
-| + forward kv compute sub-block 2048 (`sa_block_kv_compute`) | **85.3k** | **33.1%** |
-| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | **97.0k** | **37.6%** |
+| + forward kv compute sub-block 2048 (`sa_block_kv_compute`) | 85.3k | 33.1% |
+| + `esmc_barrier_input_layernorm` (QKV stops recomputing LN1) | 85.5k | 33.1% |
+| + `esmc_qk_split_halves` (one lane roll for `rotate_half`) | **86.1k** | **33.4%** |
+| `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` (+ `xla_tpu_dvfs_p_state=7`) | **97.4k** | **37.7%** |
 
 `hf_esmc600m_mlm_uniref50_graph_opt_pstate7` adds TPU7x performance state 7
 (`tpu_flags.TPU7X_THROUGHPUT_P_STATE`): a higher clock with the same compiled
@@ -191,6 +193,14 @@ torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
   lanes once per row tile; LLO showed the kernel's critical path was cross-lane
   (XLU) reductions and rotates. The smaller live set lets `block_s` grow to
   1024 (64 MiB VMEM).
+- **Split-halves q/k lanes** (`esmc_qk_split_halves`): each 128-lane group
+  holds `[h0[:32] | h1[:32] | h0[32:] | h1[32:]]`, so `rotate_half` is one
+  64-lane roll and every head keeps its own lanes in the folded q/k. The
+  q/k projection and norm weights are row-gathered per step; parameters and
+  checkpoints keep the HF layout.
+- **Input-LayerNorm barrier** (`esmc_barrier_input_layernorm`): forward-only
+  optimization barrier on LN1, so the QKV matmuls read it instead of
+  recomputing it per tile (+2.5 GiB).
 - **`optimizer_in_graph`**: removes the separate grad-norm / AdamW programs
   and their per-step dispatch gaps. Supports **one microbatch per optimizer
   step only** (it raises otherwise), so it does not apply to the 4.19M-token
