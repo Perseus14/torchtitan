@@ -203,6 +203,25 @@ torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
   --checkpoint.no-enable
 ```
 
+The MFU-optimized recipe (77.3k tok/s/TC, 30.0% MFU; see
+`hf_esmc600m_mlm_uniref50_graph_opt` above) sets the model and the
+`16 x 2048` microbatch itself:
+
+```bash
+TORCH_TPU_TIER2_COMPILATION_CACHE=$USER \
+torchrun --nproc_per_node=8 -m torchtitan.experiments.tpu.train \
+  --module=torchtitan.experiments.tpu.transformers_modeling_backend \
+  --config=hf_esmc600m_mlm_uniref50_graph_opt \
+  --hf_assets_path=$ASSETS/esmc_tokenizer \
+  --dataloader.dataset_path=$DATA/uniref50 \
+  --training.steps=600 \
+  --checkpoint.no-enable
+# p-state 7: --config=hf_esmc600m_mlm_uniref50_graph_opt_pstate7
+# opt-ins (31.6% together): --tpu_config.optimizer_in_graph
+#   --tpu_config.no-compile_grad_norm --tpu_config.no-compile_optimizer
+#   --splash_attention_kernel.sa_max_logit_const 0.0
+```
+
 Full `tpu7x-16` slice (2 hosts x 8 TensorCores) at the paper's 4,194,304-token
 optimizer step without rematerialization (`16 x 2048` tokens/rank x 8
 microbatches, `--config=hf_esmc600m_mlm_uniref50_tpu7x16`). Run on **each** host
